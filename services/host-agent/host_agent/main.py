@@ -1,0 +1,543 @@
+import base64
+import hashlib
+import json
+import re
+import shutil
+import sqlite3
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Iterator
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from mutagen import File as MutagenFile
+from pydantic import BaseModel
+
+from .config import get_config
+from .db import connect_db
+
+SUPPORTED_EXTS = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".flac": "audio/flac"}
+DRM_EXTS = {".m4p"}
+LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]")
+
+
+def _has_timed_lrc(lrc_text: str) -> bool:
+    return bool(LRC_TIMESTAMP_RE.search(lrc_text))
+
+
+def _song_id(canonical_path: Path) -> str:
+    return hashlib.sha256(str(canonical_path).encode("utf-8")).hexdigest()[:16]
+
+
+def _is_within_approved(file_path: Path, approved_dirs: list[Path]) -> bool:
+    resolved = file_path.resolve()
+    return any(resolved == d or d in resolved.parents for d in approved_dirs)
+
+
+def _has_drm(file_path: Path) -> bool:
+    if file_path.suffix.lower() in DRM_EXTS:
+        return True
+    if file_path.suffix.lower() == ".m4a":
+        with file_path.open("rb") as f:
+            head = f.read(65536)
+        if b"drms" in head or b"sinf" in head:
+            return True
+    return False
+
+
+def _content_fingerprint(file_path: Path, size_bytes: int) -> str:
+    h = hashlib.sha256()
+    h.update(str(size_bytes).encode("ascii"))
+    with file_path.open("rb") as f:
+        h.update(f.read(65536))
+        if size_bytes > 65536:
+            f.seek(max(0, size_bytes - 65536))
+            h.update(f.read(65536))
+    return h.hexdigest()[:24]
+
+
+def _ffprobe_metadata(file_path: Path) -> tuple[str, str, str | None, int] | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(file_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        fmt = json.loads(proc.stdout).get("format", {})
+        tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+        title = tags.get("title") or file_path.stem
+        artist = tags.get("artist") or ""
+        album = tags.get("album")
+        duration_ms = int(float(fmt.get("duration") or 0) * 1000)
+        return title, artist, album, duration_ms
+    except Exception:
+        return None
+
+
+def _read_metadata(file_path: Path) -> tuple[str, str, str | None, int]:
+    probed = _ffprobe_metadata(file_path)
+    if probed is not None and probed[3] > 0:
+        return probed
+
+    title = probed[0] if probed else file_path.stem
+    artist = probed[1] if probed else ""
+    album = probed[2] if probed else None
+    duration_ms = probed[3] if probed else 0
+    try:
+        audio = MutagenFile(file_path, easy=True)
+        if audio is not None:
+            if duration_ms == 0 and getattr(audio, "info", None) and getattr(audio.info, "length", 0):
+                duration_ms = int(audio.info.length * 1000)
+            if audio.tags:
+                title = (audio.tags.get("title") or [title])[0]
+                artist = (audio.tags.get("artist") or [artist])[0]
+                album_list = audio.tags.get("album")
+                album = album_list[0] if album_list else album
+    except Exception:
+        pass
+    return title, artist, album, duration_ms
+
+
+def _song_row_to_dict(r: sqlite3.Row) -> dict:
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "artist": r["artist"],
+        "album": r["album"],
+        "duration_ms": r["duration_ms"],
+        "format": r["format"],
+        "readiness": r["readiness"],
+        "has_lyrics": bool(r["has_lyrics"]),
+        "has_instrumental": bool(r["has_instrumental"]),
+        "duplicate_of": r["duplicate_of"],
+    }
+
+
+def _encode_cursor(title: str, song_id: str) -> str:
+    raw = json.dumps([title, song_id]).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        title, song_id = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        return str(title), str(song_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid cursor") from exc
+
+
+class SelectLibraryRequest(BaseModel):
+    path: str
+
+
+class UpdateLyricsRequest(BaseModel):
+    lrc_text: str
+    offset_ms: int = 0
+    source: str = "manual"
+
+
+def create_app(db_conn: sqlite3.Connection | None = None) -> FastAPI:
+    cfg = get_config()
+    conn = db_conn or connect_db(cfg["db_path"])
+
+    app = FastAPI(title="GeeT Host Agent", version="0.2.0")
+    origins = list({cfg["app_origin"], "http://localhost:5173", "http://127.0.0.1:5173"})
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_headers=["Content-Type", "Range"],
+        expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
+    )
+
+    def _approved_paths() -> list[Path]:
+        rows = conn.execute("SELECT path FROM approved_dirs").fetchall()
+        return [Path(r["path"]).resolve() for r in rows]
+
+    @app.get("/health")
+    def health():
+        dir_count = conn.execute("SELECT COUNT(*) FROM approved_dirs").fetchone()[0]
+        song_count = conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        return {
+            "status": "ok",
+            "sqlite": True,
+            "ffmpeg": shutil.which("ffmpeg") is not None,
+            "ffprobe": shutil.which("ffprobe") is not None,
+            "approved_dirs": dir_count,
+            "song_count": song_count,
+        }
+
+    @app.post("/library/select")
+    def select_library(req: SelectLibraryRequest):
+        target = Path(req.path).expanduser().resolve()
+        if not target.exists() or not target.is_dir():
+            raise HTTPException(status_code=400, detail="Directory does not exist")
+        conn.execute("INSERT OR IGNORE INTO approved_dirs (path) VALUES (?)", (str(target),))
+        conn.commit()
+        return {"ok": True, "approved_dirs": len(_approved_paths())}
+
+    @app.post("/library/scan")
+    def scan_library():
+        job_id = uuid.uuid4().hex[:12]
+        conn.execute("INSERT INTO jobs (id, kind, status, progress) VALUES (?, 'scan', 'running', 0)", (job_id,))
+        conn.commit()
+
+        dirs = _approved_paths()
+        existing = {
+            r["id"]: (r["size_bytes"], r["mtime_ns"], r["file_path"])
+            for r in conn.execute("SELECT id, size_bytes, mtime_ns, file_path FROM songs").fetchall()
+        }
+
+        scanned = 0
+        skipped_unchanged = 0
+        rejected_drm = 0
+        duplicates = 0
+        seen_ids: set[str] = set()
+        cancelled = False
+
+        for d in dirs:
+            if not d.exists():
+                continue
+            for p in d.rglob("*"):
+                if conn.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()[0]:
+                    cancelled = True
+                    break
+                if not p.is_file():
+                    continue
+                ext = p.suffix.lower()
+                if ext in DRM_EXTS or (ext in SUPPORTED_EXTS and _has_drm(p)):
+                    rejected_drm += 1
+                    continue
+                if ext not in SUPPORTED_EXTS:
+                    continue
+
+                canonical = p.resolve()
+                sid = _song_id(canonical)
+                seen_ids.add(sid)
+                stat = canonical.stat()
+                prev = existing.get(sid)
+                if prev and prev[0] == stat.st_size and prev[1] == stat.st_mtime_ns:
+                    skipped_unchanged += 1
+                    continue
+
+                title, artist, album, duration_ms = _read_metadata(canonical)
+                chash = _content_fingerprint(canonical, stat.st_size)
+                dup_row = conn.execute(
+                    "SELECT id FROM songs WHERE content_hash = ? AND id <> ? ORDER BY updated_at ASC LIMIT 1",
+                    (chash, sid),
+                ).fetchone()
+                dup_of = dup_row["id"] if dup_row else None
+                if dup_of:
+                    duplicates += 1
+
+                conn.execute(
+                    """
+                    INSERT INTO songs (
+                        id, file_path, title, artist, album, duration_ms, format,
+                        size_bytes, mtime_ns, content_hash, duplicate_of
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        artist = excluded.artist,
+                        album = excluded.album,
+                        duration_ms = excluded.duration_ms,
+                        size_bytes = excluded.size_bytes,
+                        mtime_ns = excluded.mtime_ns,
+                        content_hash = excluded.content_hash,
+                        duplicate_of = excluded.duplicate_of,
+                        updated_at = datetime('now')
+                    """,
+                    (
+                        sid,
+                        str(canonical),
+                        title,
+                        artist,
+                        album,
+                        duration_ms,
+                        ext.lstrip("."),
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        chash,
+                        dup_of,
+                    ),
+                )
+                scanned += 1
+            if cancelled:
+                break
+
+        removed = 0
+        if not cancelled:
+            for sid in set(existing.keys()) - seen_ids:
+                conn.execute("DELETE FROM songs WHERE id = ?", (sid,))
+                removed += 1
+
+        final_status = "cancelled" if cancelled else "completed"
+        detail = f"scanned={scanned} unchanged={skipped_unchanged} removed={removed} drm={rejected_drm} dup={duplicates}"
+        conn.execute(
+            "UPDATE jobs SET status = ?, progress = 100, detail = ?, updated_at = datetime('now') WHERE id = ?",
+            (final_status, detail, job_id),
+        )
+        conn.commit()
+        return {
+            "job_id": job_id,
+            "status": final_status,
+            "scanned": scanned,
+            "skipped_unchanged": skipped_unchanged,
+            "removed": removed,
+            "rejected_drm": rejected_drm,
+            "duplicates": duplicates,
+        }
+
+    @app.get("/library/songs")
+    def list_songs(
+        query: str = "",
+        cursor: str | None = None,
+        limit: int = Query(default=50, ge=1, le=200),
+    ):
+        like = f"%{query.strip()}%"
+        params: list = [like, like]
+        cursor_clause = ""
+        if cursor:
+            c_title, c_id = _decode_cursor(cursor)
+            cursor_clause = "AND (title > ? OR (title = ? AND id > ?))"
+            params.extend([c_title, c_title, c_id])
+
+        params.append(limit + 1)
+        rows = conn.execute(
+            f"""
+            SELECT id, title, artist, album, duration_ms, format, readiness, has_lyrics, has_instrumental, duplicate_of
+            FROM songs
+            WHERE (title LIKE ? OR artist LIKE ?)
+            {cursor_clause}
+            ORDER BY title ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        next_cursor = _encode_cursor(page_rows[-1]["title"], page_rows[-1]["id"]) if has_more else None
+        return {"songs": [_song_row_to_dict(r) for r in page_rows], "next_cursor": next_cursor}
+
+    @app.get("/library/songs/{song_id}")
+    def get_song(song_id: str):
+        row = conn.execute(
+            """
+            SELECT id, title, artist, album, duration_ms, format, readiness, has_lyrics, has_instrumental, duplicate_of
+            FROM songs WHERE id = ?
+            """,
+            (song_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Song not found")
+        return _song_row_to_dict(row)
+
+    @app.get("/jobs/{job_id}")
+    def get_job(job_id: str):
+        row = conn.execute("SELECT id, kind, status, progress, detail FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return dict(row)
+
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str):
+        row = conn.execute("SELECT id, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row["status"] in ("completed", "failed", "cancelled"):
+            return {"id": job_id, "status": row["status"]}
+        conn.execute(
+            "UPDATE jobs SET cancel_requested = 1, status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
+            (job_id,),
+        )
+        conn.commit()
+        return {"id": job_id, "status": "cancelled"}
+
+    @app.get("/songs/{song_id}/lyrics")
+    def get_lyrics(song_id: str):
+        song = conn.execute("SELECT id, file_path FROM songs WHERE id = ?", (song_id,)).fetchone()
+        if not song:
+            raise HTTPException(status_code=404, detail="Song not found")
+
+        row = conn.execute(
+            "SELECT song_id, lrc_text, offset_ms, source, synchronized_ready FROM lyrics WHERE song_id = ?",
+            (song_id,),
+        ).fetchone()
+        if row:
+            return {
+                "song_id": row["song_id"],
+                "lrc_text": row["lrc_text"],
+                "offset_ms": row["offset_ms"],
+                "source": row["source"],
+                "synchronized_ready": bool(row["synchronized_ready"]),
+            }
+
+        sidecar = Path(song["file_path"]).resolve().with_suffix(".lrc")
+        if sidecar.is_file() and _is_within_approved(sidecar, _approved_paths()):
+            text = sidecar.read_text(encoding="utf-8", errors="replace")
+            sync_ready = _has_timed_lrc(text)
+            conn.execute(
+                """
+                INSERT INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready)
+                VALUES (?, ?, 0, 'sidecar', ?)
+                """,
+                (song_id, text, int(sync_ready)),
+            )
+            conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
+            conn.commit()
+            return {
+                "song_id": song_id,
+                "lrc_text": text,
+                "offset_ms": 0,
+                "source": "sidecar",
+                "synchronized_ready": sync_ready,
+            }
+
+        return {
+            "song_id": song_id,
+            "lrc_text": "",
+            "offset_ms": 0,
+            "source": "none",
+            "synchronized_ready": False,
+        }
+
+    @app.put("/songs/{song_id}/lyrics")
+    def put_lyrics(song_id: str, req: UpdateLyricsRequest):
+        if not conn.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Song not found")
+        source = req.source if req.source in ("sidecar", "manual", "lrclib") else "manual"
+        sync_ready = _has_timed_lrc(req.lrc_text)
+        conn.execute(
+            """
+            INSERT INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(song_id) DO UPDATE SET
+                lrc_text = excluded.lrc_text,
+                offset_ms = excluded.offset_ms,
+                source = excluded.source,
+                synchronized_ready = excluded.synchronized_ready,
+                updated_at = datetime('now')
+            """,
+            (song_id, req.lrc_text, req.offset_ms, source, int(sync_ready)),
+        )
+        conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
+        conn.commit()
+        return {
+            "song_id": song_id,
+            "lrc_text": req.lrc_text,
+            "offset_ms": req.offset_ms,
+            "source": source,
+            "synchronized_ready": sync_ready,
+        }
+
+    @app.post("/songs/{song_id}/lyrics/lookup")
+    def lookup_lrclib(song_id: str):
+        song = conn.execute(
+            "SELECT title, artist, album, duration_ms FROM songs WHERE id = ?", (song_id,)
+        ).fetchone()
+        if not song:
+            raise HTTPException(status_code=404, detail="Song not found")
+        if not song["title"] or not song["artist"]:
+            return {"found": False, "reason": "Missing title or artist metadata"}
+
+        params: dict[str, str | int] = {
+            "track_name": song["title"],
+            "artist_name": song["artist"],
+        }
+        if song["album"]:
+            params["album_name"] = song["album"]
+        if song["duration_ms"] > 0:
+            params["duration"] = round(song["duration_ms"] / 1000)
+
+        try:
+            resp = httpx.get("https://lrclib.net/api/get", params=params, timeout=8.0)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"LRCLIB lookup failed: {exc}") from exc
+
+        if resp.status_code == 404:
+            return {"found": False, "reason": "No match on LRCLIB"}
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"LRCLIB returned {resp.status_code}")
+
+        data = resp.json()
+        synced = data.get("syncedLyrics") or ""
+        remote_dur = data.get("duration") or 0
+        if song["duration_ms"] > 0 and remote_dur > 0:
+            if abs(remote_dur - (song["duration_ms"] / 1000)) > 5:
+                return {"found": False, "reason": "Duration mismatch (>5s)"}
+
+        return {
+            "found": bool(synced),
+            "synced_lyrics": synced,
+            "plain_lyrics": data.get("plainLyrics") or "",
+            "duration_s": remote_dur,
+            "reason": None if synced else "Only unsynced lyrics found",
+        }
+
+    @app.get("/media/{song_id}")
+    def stream_media(song_id: str, request: Request):
+        row = conn.execute("SELECT file_path FROM songs WHERE id = ?", (song_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Song not found")
+
+        file_path = Path(row["file_path"]).resolve()
+        if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        mime = SUPPORTED_EXTS.get(file_path.suffix.lower())
+        if not mime:
+            raise HTTPException(status_code=415, detail="Unsupported media type")
+
+        file_size = file_path.stat().st_size
+        range_header = request.headers.get("range")
+        start = 0
+        end = file_size - 1
+        status_code = 200
+
+        if range_header and range_header.startswith("bytes="):
+            spec = range_header.removeprefix("bytes=").split(",")[0].strip()
+            parts = spec.split("-")
+            if parts[0]:
+                start = int(parts[0])
+            if len(parts) > 1 and parts[1]:
+                end = min(int(parts[1]), file_size - 1)
+            if start > end or start >= file_size:
+                raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+            status_code = 206
+
+        length = end - start + 1
+
+        def iter_file() -> Iterator[bytes]:
+            with file_path.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+        }
+        if status_code == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+        return StreamingResponse(iter_file(), status_code=status_code, media_type=mime, headers=headers)
+
+    return app
+
+
+app = create_app()

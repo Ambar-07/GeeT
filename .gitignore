@@ -1,0 +1,24 @@
+# Node / Web
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+*.local
+.env
+.env.*
+!.env.example
+
+# Python / Host Agent
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+services/host-agent/data/
+services/host-agent/cache/
+*.db
+*.sqlite3
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
