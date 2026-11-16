@@ -65,3 +65,52 @@ export type RoomStatus = z.infer<typeof RoomStatusSchema>;
 
 export const QueueEntryStatusSchema = z.enum(["queued", "playing", "played", "skipped"]);
 export type QueueEntryStatus = z.infer<typeof QueueEntryStatusSchema>;
+
+export const RoomSchema = z.object({
+  id: z.string().uuid(),
+  code: z.string(),
+  host_user_id: z.string().uuid(),
+  status: RoomStatusSchema,
+  revision: z.number().int(),
+  created_at: z.string(),
+  expires_at: z.string(),
+});
+export type Room = z.infer<typeof RoomSchema>;
+
+export const RoomParticipantSchema = z.object({
+  room_id: z.string().uuid(),
+  user_id: z.string().uuid(),
+  display_name: z.string(),
+  role: z.enum(["host", "participant"]),
+  joined_at: z.string(),
+  last_seen: z.string(),
+  revoked_at: z.string().nullable().optional(),
+});
+export type RoomParticipant = z.infer<typeof RoomParticipantSchema>;
+
+export const RoomSongSchema = z.object({
+  id: z.string().uuid(),
+  room_id: z.string().uuid(),
+  host_song_id: z.string(),
+  title: z.string(),
+  artist: z.string(),
+  duration_ms: z.number().int().nonnegative(),
+  readiness: z.enum(["raw", "preparing", "ready", "failed"]),
+});
+export type RoomSong = z.infer<typeof RoomSongSchema>;
+
+export const PlaybackStateSchema = z.object({
+  room_id: z.string().uuid(),
+  song_id: z.string().uuid().nullable(),
+  status: z.enum(["idle", "playing", "paused", "ended"]),
+  position_ms: z.number().int().nonnegative(),
+  revision: z.number().int(),
+  updated_at: z.string(),
+});
+export type PlaybackState = z.infer<typeof PlaybackStateSchema>;
+
+/** Build QR/join URL containing only the origin and room code (never session tokens). */
+export function buildJoinUrl(origin: string, code: string): string {
+  const cleanOrigin = origin.replace(/\/+$/, "");
+  return `${cleanOrigin}/join/${encodeURIComponent(code.trim().toUpperCase())}`;
+}

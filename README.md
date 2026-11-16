@@ -11,15 +11,15 @@ Audio files, processed stems, full library paths, and local credentials remain s
 
 ## Project Status and Progress Overview
 
-Overall Delivery Progress: 33% (3 of 9 roadmap phases verified).
+Overall Delivery Progress: 44% (4 of 9 roadmap phases implemented in code).
 
 | Phase | Milestone | Status | Test & Gate Status |
 | :--- | :--- | :--- | :--- |
 | Phase 1 | Foundation (Monorepo, Agent Skeleton, Cloud Schema, Baseline UI) | Completed | Verified (Vitest, Pytest, Build) |
 | Phase 2 | Library Indexing (Incremental Scan, Deduplication, Cursor Pagination) | Completed | Verified (100 Mixed Files Test Gate) |
 | Phase 3 | Lyrics Pipeline (LRC Parser, Sidecar Import, Offset Calibration, LRCLIB Integration) | Completed | Verified (10 Timed Songs Test Gate) |
-| Phase 4 | Room Lifecycle & Realtime (Guest Auth, Room Creation, QR Code, State Sync) | Pending | Scheduled next |
-| Phase 5 | Queue Management & Mutational RPCs (Atomic Ordering, Idempotency) | Pending | Planned |
+| Phase 4 | Room Lifecycle & Realtime (Guest Auth, Room Creation, QR Code, State Sync) | Completed (Code) | Unit & Build Verified (Live Cloud Gate Pending) |
+| Phase 5 | Queue Management & Mutational RPCs (Atomic Ordering, Idempotency) | Pending | Scheduled next |
 | Phase 6 | Local Instrumental Separation (CPU/GPU Fallback, Cache Management) | Pending | Planned |
 | Phase 7 | Hardening (Security Verification, Rate Limiting, Failure Recovery) | Pending | Planned |
 | Phase 8 | Production Deployment (Cloudflare Pages Build, Supabase Migrations, Runbooks) | Pending | Planned |
@@ -32,8 +32,9 @@ Overall Delivery Progress: 33% (3 of 9 roadmap phases verified).
 ### 1. Ready and Implemented Components
 
 #### Shared Contracts (`packages/shared`)
-- Type definitions and Zod schemas for room states, queue entry statuses, song readiness flags, host agent health records, paginated catalogue pages, background jobs, and lyric records.
+- Type definitions and Zod schemas for room records (`RoomSchema`), participants (`RoomParticipantSchema`), published room songs (`RoomSongSchema`), playback states (`PlaybackStateSchema`), queue entry statuses, song readiness flags, host agent health records, paginated catalogue pages, background jobs, and lyric records.
 - Standardized cross-boundary data validation between frontend and local agent.
+- Token-free join URL builder (`buildJoinUrl`) ensuring zero credential leakage in QR codes and share links.
 
 #### Lyrics Engine (`packages/lyrics`)
 - Standard LRC parser supporting single and multi-timestamp records.
@@ -49,42 +50,48 @@ Overall Delivery Progress: 33% (3 of 9 roadmap phases verified).
 - SQLite job ledger tracking scanning and processing states with cancellation capabilities.
 - Timed lyrics management with automatic sidecar `.lrc` ingestion, durable manual updates, and metadata-validated LRCLIB querying.
 
-#### Supabase Database Architecture (`supabase/migrations/0001_initial_schema.sql`)
-- Tables: `rooms`, `room_participants`, `room_songs`, `queue_entries`, `playback_state`.
-- Row Level Security (RLS) enabled on all exposed tables with explicit membership and host authorization policies using `SECURITY DEFINER` functions with fixed search paths.
-- Transactional database functions for room creation, participant joining, queue insertion with idempotency keys, entry removal, and room closure.
-- Direct mutations revoked from client roles, routing operations through validated RPC interfaces.
+#### Supabase Database Architecture (`supabase/migrations/`)
+- Migration `0001_initial_schema.sql`: Core tables (`rooms`, `room_participants`, `room_songs`, `queue_entries`, `playback_state`), Row Level Security (RLS) enabled on all exposed tables with explicit membership and host authorization policies using `SECURITY DEFINER` functions with fixed search paths (`SET search_path = public, pg_temp`), and transactional functions for room creation, participant joining, queue insertion with idempotency keys, entry removal, and room closure.
+- Migration `0002_room_realtime_and_capability.sql`: Column-level privilege revocation preventing PostgREST select access to `rooms.host_capability_hash`, transactional `set_room_status` RPC validating both `auth.uid()` and SHA-256 capability hash, and automatic registration of room tables to the `supabase_realtime` publication.
+
+#### Room & Realtime Coordination (`apps/web/src/lib/rooms.ts`)
+- Anonymous Supabase authentication session handling (`ensureAuthSession`).
+- Host room creation with session-scoped high-entropy capability storage.
+- Participant room join by alphanumeric code and display name.
+- Batched metadata publication (`publishRoomSongs`) in 100-song chunks, strictly excluding private paths, audio payloads, and DRM files.
+- Authoritative snapshot synchronization with revision comparison (`reconcileSnapshot`) to prevent stale overwrites.
+- Realtime channel bindings for Postgres table changes (`rooms`, `room_participants`, `room_songs`, `playback_state`), client presence tracking, and throttled broadcast reactions (maximum 1 event per 2 seconds).
 
 #### Web Interface (`apps/web`)
 - React 19 application utilizing React Router and Tailwind CSS.
-- Host Console featuring agent health diagnostics, directory configuration, incremental scanner triggers, cursor-paginated song browsing, local audio player, and an interactive lyrics sync and calibration interface.
-- Client route structure established for `/`, `/host`, `/join/:code`, and `/room/:code`.
-- Cloudflare Pages single-page application routing configuration via `_redirects`.
+- Host Console:
+  - Agent health diagnostics and directory allowlist management.
+  - Incremental library scan triggers and cursor-paginated song browsing.
+  - Local audio player with `requestAnimationFrame` lyric visualizer and offset controls (±100 ms, ±500 ms, ±1 s, reset).
+  - Cloud Room control panel (`HostRoomPanel`) featuring live QR code generation via `qrcode`, participant and presence counters, pause/resume/close controls, and catalogue publishing.
+- Participant Room Interface (`RoomPage`):
+  - Join form with session recovery on refresh.
+  - Live status indicators and host-disconnection / room-closure notices.
+  - Client-side reaction dispatcher with quota-protecting throttling.
+  - Debounced real-time catalogue search over host-published songs.
+- Routing and Infrastructure: Single-page application fallback routing configured for Cloudflare Pages via `_redirects`.
 
 ---
 
 ### 2. Pending Capabilities
 
-1. **Phase 4 - Room Lifecycle, QR Code and Realtime Sync**
-   - Supabase anonymous authentication integration.
-   - Host room initialization with high-entropy host capability token.
-   - Client join flow with QR code generation.
-   - Host catalogue publishing to Supabase `room_songs`.
-   - Realtime channel bindings for room state, presence, and queue notifications.
-
-2. **Phase 5 - Queue Operations & Reconnection Robustness**
+1. **Phase 5 - Queue Operations & Reconnection Robustness**
    - Server-side atomic queue sequencing and idempotency validation.
-   - Participant song search within published room scope.
-   - Host queue controls (skip, reorder, remove).
+   - Client-side queue view with reordering, skipping, and removal RPC functions.
    - Reconnection state reconciliation ensuring offline playback continuity on network interruptions.
 
-3. **Phase 6 - Local Audio Separation**
+2. **Phase 6 - Local Audio Separation**
    - Local separation engine (Demucs or lightweight ONNX models) with CPU fallback.
    - Background processing queue prioritizing currently queued songs over general library files.
    - Instrumental stem caching and atomic cache promotion.
    - Fallback playback to original track when separation is pending or failed.
 
-4. **Phase 7 through 9 - Production Hardening, Deployment & WebRTC**
+3. **Phase 7 through 9 - Production Hardening, Deployment & WebRTC**
    - Adversarial security testing against RLS policies.
    - Cloudflare Pages deployment automation and production environment binding.
    - Backup, export, and disaster recovery runbooks.

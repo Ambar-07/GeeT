@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { HostHealth, HostSong } from "@geet/shared";
+import { HostRoomPanel } from "../components/HostRoomPanel";
 import { LyricsPanel } from "../components/LyricsPanel";
 import {
   fetchHostHealth,
@@ -103,6 +104,8 @@ export function HostPage() {
           </p>
         </div>
       </section>
+
+      <HostRoomPanel />
 
       <section className="rounded-xl border border-slate-800 bg-slate-900 p-4">
         <h2 className="text-sm font-semibold text-slate-300">Import Local Music Folder</h2>

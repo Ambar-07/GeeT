@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HostHealthSchema, HostSongSchema } from "./index";
+import { buildJoinUrl, HostHealthSchema, HostSongSchema } from "./index";
 
 describe("shared schemas", () => {
   it("validates host health payload", () => {
@@ -27,5 +27,11 @@ describe("shared schemas", () => {
         has_instrumental: false,
       })
     ).toThrow();
+  });
+
+  it("builds token-free uppercase join URLs", () => {
+    expect(buildJoinUrl("https://geet.pages.dev/", " ab12cd ")).toBe(
+      "https://geet.pages.dev/join/AB12CD"
+    );
   });
 });
