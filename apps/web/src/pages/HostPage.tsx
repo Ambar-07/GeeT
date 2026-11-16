@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { HostHealth, HostSong } from "@geet/shared";
-import { HostRoomPanel } from "../components/HostRoomPanel";
+import { HostRoomPanel, type PlaybackEventSignal } from "../components/HostRoomPanel";
 import { LyricsPanel } from "../components/LyricsPanel";
 import {
   fetchHostHealth,
+  fetchSong,
   fetchSongsPage,
   mediaUrl,
   scanLibrary,
@@ -21,7 +22,28 @@ export function HostPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [activeSong, setActiveSong] = useState<HostSong | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [playbackSignal, setPlaybackSignal] = useState<PlaybackEventSignal | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const songsRef = useRef<HostSong[]>([]);
+  songsRef.current = songs;
+
+  const handlePlayHostSong = useCallback(async (hostSongId: string) => {
+    const local = songsRef.current.find((s) => s.id === hostSongId);
+    if (local) {
+      setActiveSong(local);
+      return;
+    }
+    try {
+      setActiveSong(await fetchSong(hostSongId));
+    } catch (err) {
+      setStatusMsg(err instanceof Error ? err.message : "Failed to load queued song");
+    }
+  }, []);
+
+  function emitPlayback(type: PlaybackEventSignal["type"]) {
+    const posMs = Math.round((audioRef.current?.currentTime ?? 0) * 1000);
+    setPlaybackSignal((prev) => ({ type, positionMs: posMs, seq: (prev?.seq ?? 0) + 1 }));
+  }
 
   async function refresh(searchQuery = query) {
     try {
@@ -105,7 +127,7 @@ export function HostPage() {
         </div>
       </section>
 
-      <HostRoomPanel />
+      <HostRoomPanel onPlayHostSong={handlePlayHostSong} playbackSignal={playbackSignal} />
 
       <section className="rounded-xl border border-slate-800 bg-slate-900 p-4">
         <h2 className="text-sm font-semibold text-slate-300">Import Local Music Folder</h2>
@@ -139,6 +161,9 @@ export function HostPage() {
             controls
             autoPlay
             src={mediaUrl(activeSong.id)}
+            onPlay={() => emitPlayback("playing")}
+            onPause={() => emitPlayback("paused")}
+            onEnded={() => emitPlayback("ended")}
             className="mt-3 w-full"
           />
           <LyricsPanel song={activeSong} audioRef={audioRef} />

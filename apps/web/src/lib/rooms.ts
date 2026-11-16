@@ -1,11 +1,13 @@
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import {
   PlaybackStateSchema,
+  QueueEntrySchema,
   RoomParticipantSchema,
   RoomSchema,
   RoomSongSchema,
   type HostSong,
   type PlaybackState,
+  type QueueEntry,
   type Room,
   type RoomParticipant,
   type RoomSong,
@@ -18,6 +20,7 @@ export interface RoomSnapshot {
   room: Room;
   participants: RoomParticipant[];
   songs: RoomSong[];
+  queue: QueueEntry[];
   playback: PlaybackState | null;
 }
 
@@ -141,24 +144,121 @@ export async function fetchRoomIdByCode(code: string): Promise<string | null> {
 
 export async function fetchRoomSnapshot(roomId: string): Promise<RoomSnapshot> {
   const client = requireSupabase();
-  const [roomRes, partRes, songsRes, pbRes] = await Promise.all([
+  const [roomRes, partRes, songsRes, queueRes, pbRes] = await Promise.all([
     client.from("rooms").select(ROOM_SELECT_COLS).eq("id", roomId).single(),
     client.from("room_participants").select("*").eq("room_id", roomId).is("revoked_at", null),
     client.from("room_songs").select("*").eq("room_id", roomId).order("title").limit(200),
+    client
+      .from("queue_entries")
+      .select("*")
+      .eq("room_id", roomId)
+      .in("status", ["playing", "queued"])
+      .order("position", { ascending: true })
+      .order("created_at", { ascending: true }),
     client.from("playback_state").select("*").eq("room_id", roomId).maybeSingle(),
   ]);
 
   if (roomRes.error) throw roomRes.error;
   if (partRes.error) throw partRes.error;
   if (songsRes.error) throw songsRes.error;
+  if (queueRes.error) throw queueRes.error;
   if (pbRes.error) throw pbRes.error;
 
   return {
     room: RoomSchema.parse(roomRes.data),
     participants: z.array(RoomParticipantSchema).parse(partRes.data ?? []),
     songs: z.array(RoomSongSchema).parse(songsRes.data ?? []),
+    queue: z.array(QueueEntrySchema).parse(queueRes.data ?? []),
     playback: pbRes.data ? PlaybackStateSchema.parse(pbRes.data) : null,
   };
+}
+
+export async function addSongToQueue(
+  roomId: string,
+  songId: string,
+  idempotencyKey = crypto.randomUUID()
+): Promise<string> {
+  const client = requireSupabase();
+  const { data, error } = await client.rpc("add_song", {
+    p_room_id: roomId,
+    p_song_id: songId,
+    p_idempotency_key: idempotencyKey,
+  });
+  if (error) throw error;
+  return String(data);
+}
+
+export async function removeSongFromQueue(roomId: string, entryId: string): Promise<void> {
+  const client = requireSupabase();
+  const { error } = await client.rpc("remove_song", {
+    p_room_id: roomId,
+    p_entry_id: entryId,
+  });
+  if (error) throw error;
+}
+
+export async function reorderRoomQueue(
+  roomId: string,
+  orderedEntryIds: string[],
+  capability: string
+): Promise<number> {
+  const client = requireSupabase();
+  const { data, error } = await client.rpc("reorder_queue", {
+    p_room_id: roomId,
+    p_ordered_entry_ids: orderedEntryIds,
+    p_capability: capability,
+  });
+  if (error) throw error;
+  return Number(data);
+}
+
+export async function advanceRoomQueue(
+  roomId: string,
+  action: "next" | "skip" | "play_entry",
+  capability: string,
+  entryId: string | null = null
+): Promise<number> {
+  const client = requireSupabase();
+  const { data, error } = await client.rpc("advance_queue", {
+    p_room_id: roomId,
+    p_action: action,
+    p_capability: capability,
+    p_entry_id: entryId,
+  });
+  if (error) throw error;
+  return Number(data);
+}
+
+export async function syncPlaybackCheckpoint(
+  roomId: string,
+  status: "idle" | "playing" | "paused" | "ended",
+  positionMs: number,
+  capability: string
+): Promise<number> {
+  const client = requireSupabase();
+  const { data, error } = await client.rpc("sync_playback_checkpoint", {
+    p_room_id: roomId,
+    p_status: status,
+    p_position_ms: Math.max(0, Math.round(positionMs)),
+    p_capability: capability,
+  });
+  if (error) throw error;
+  return Number(data);
+}
+
+/** Compute next ordered IDs for queued entries after shifting one entry up or down. */
+export function moveQueueEntry(
+  entries: readonly QueueEntry[],
+  entryId: string,
+  direction: "up" | "down"
+): string[] {
+  const queued = entries.filter((e) => e.status === "queued").map((e) => e.id);
+  const idx = queued.indexOf(entryId);
+  if (idx === -1) return queued;
+  const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= queued.length) return queued;
+  [queued[idx], queued[swapIdx]] = [queued[swapIdx], queued[idx]];
+  return queued;
 }
 
 /** Reconcile snapshot against current local revision; returns incoming if newer or on reconnect. */
@@ -216,6 +316,11 @@ export function subscribeToRoom(
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "room_songs", filter: `room_id=eq.${roomId}` },
+      () => void refresh()
+    )
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "queue_entries", filter: `room_id=eq.${roomId}` },
       () => void refresh()
     )
     .on(

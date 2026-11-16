@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
+  addSongToQueue,
   ensureAuthSession,
   fetchRoomIdByCode,
   fetchRoomSnapshot,
   joinRoomAsParticipant,
   reconcileSnapshot,
+  removeSongFromQueue,
   subscribeToRoom,
   type RoomSnapshot,
 } from "../lib/rooms";
@@ -28,6 +30,7 @@ export function RoomPage() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
+  const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
 
   const sendReactionRef = useRef<((label: string) => void) | null>(null);
 
@@ -102,6 +105,59 @@ export function RoomPage() {
     );
   }, [snapshot?.songs, debouncedSearch]);
 
+  const songMap = useMemo(
+    () => new Map((snapshot?.songs ?? []).map((s) => [s.id, s])),
+    [snapshot?.songs]
+  );
+  const participantMap = useMemo(
+    () => new Map((snapshot?.participants ?? []).map((p) => [p.user_id, p.display_name])),
+    [snapshot?.participants]
+  );
+
+  const queuedEntries = (snapshot?.queue ?? []).filter((q) => q.status === "queued");
+  const playingSong = snapshot?.playback?.song_id
+    ? songMap.get(snapshot.playback.song_id) ?? null
+    : null;
+
+  async function handleManualSync() {
+    if (!roomId) return;
+    try {
+      const fresh = await fetchRoomSnapshot(roomId);
+      setSnapshot((prev) => reconcileSnapshot(prev, fresh, true));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Sync failed");
+    }
+  }
+
+  async function handleQueueSong(songId: string) {
+    if (!roomId || queueBusyId) return;
+    setQueueBusyId(songId);
+    setError(null);
+    try {
+      await addSongToQueue(roomId, songId);
+      await handleManualSync();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to queue song");
+    } finally {
+      setQueueBusyId(null);
+    }
+  }
+
+  async function handleRemoveOwnEntry(entryId: string) {
+    if (!roomId || queueBusyId) return;
+    setQueueBusyId(entryId);
+    setError(null);
+    try {
+      await removeSongFromQueue(roomId, entryId);
+      await handleManualSync();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to remove song");
+    } finally {
+      setQueueBusyId(null);
+    }
+  }
+
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault();
     if (!displayName.trim() || !normalizedCode) return;
@@ -175,15 +231,24 @@ export function RoomPage() {
       <header className="flex items-center justify-between">
         <div>
           <p className="text-xs uppercase tracking-wider text-indigo-400">
-            Room {normalizedCode} • {connState}
+            Room {normalizedCode} • {connState} {snapshot ? `• Rev ${snapshot.room.revision}` : ""}
           </p>
           <h1 className="text-xl font-bold">
             {snapshot ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)` : "Loading..."}
           </h1>
         </div>
-        <Link to="/" className="text-sm text-slate-400 hover:text-slate-200">
-          Leave
-        </Link>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void handleManualSync()}
+            className="text-xs text-indigo-400 hover:underline"
+          >
+            Sync
+          </button>
+          <Link to="/" className="text-sm text-slate-400 hover:text-slate-200">
+            Leave
+          </Link>
+        </div>
       </header>
 
       {snapshot?.room.status === "host_disconnected" && (
@@ -197,6 +262,53 @@ export function RoomPage() {
           This room has been closed by the host.
         </div>
       )}
+
+      {playingSong && (
+        <section className="rounded-xl border border-indigo-500/40 bg-slate-900 p-4">
+          <p className="text-xs uppercase tracking-wider text-indigo-400">
+            Now Playing ({snapshot?.playback?.status ?? "playing"})
+          </p>
+          <p className="mt-1 text-base font-semibold">
+            {playingSong.title} {playingSong.artist ? `— ${playingSong.artist}` : ""}
+          </p>
+        </section>
+      )}
+
+      <section className="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-2">
+        <h2 className="text-sm font-semibold text-slate-300">
+          Up Next ({queuedEntries.length})
+        </h2>
+        {queuedEntries.length === 0 ? (
+          <p className="text-xs text-slate-500">Queue is empty. Add a song from the catalogue below.</p>
+        ) : (
+          <ul className="divide-y divide-slate-800">
+            {queuedEntries.map((entry, idx) => {
+              const s = songMap.get(entry.song_id);
+              const requester = participantMap.get(entry.requested_by) ?? "Member";
+              const isMine = entry.requested_by === userId;
+              return (
+                <li key={entry.id} className="flex items-center justify-between py-2 text-xs">
+                  <div>
+                    <span className="mr-2 text-slate-500">{idx + 1}.</span>
+                    <span className="font-medium text-slate-200">{s?.title ?? "Song"}</span>
+                    <span className="ml-2 text-slate-400">({requester})</span>
+                  </div>
+                  {isMine && (
+                    <button
+                      type="button"
+                      disabled={queueBusyId === entry.id}
+                      onClick={() => void handleRemoveOwnEntry(entry.id)}
+                      className="rounded border border-rose-900 px-2 py-0.5 text-rose-300 hover:bg-rose-950 disabled:opacity-40"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
 
       <section className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900 p-4">
         <span className="text-xs font-medium text-slate-400">Send Reaction (2s limit)</span>
@@ -237,9 +349,14 @@ export function RoomPage() {
                   <span className="font-medium">{song.title}</span>
                   {song.artist && <span className="ml-2 text-xs text-slate-400">{song.artist}</span>}
                 </div>
-                <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] uppercase text-slate-400">
-                  {song.readiness}
-                </span>
+                <button
+                  type="button"
+                  disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
+                  onClick={() => void handleQueueSong(song.id)}
+                  className="rounded-md bg-slate-800 px-3 py-1 text-xs font-medium hover:bg-indigo-600 disabled:opacity-40"
+                >
+                  {queueBusyId === song.id ? "Queuing..." : "Queue"}
+                </button>
               </li>
             ))}
           </ul>

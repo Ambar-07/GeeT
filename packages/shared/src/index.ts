@@ -109,6 +109,18 @@ export const PlaybackStateSchema = z.object({
 });
 export type PlaybackState = z.infer<typeof PlaybackStateSchema>;
 
+export const QueueEntrySchema = z.object({
+  id: z.string().uuid(),
+  room_id: z.string().uuid(),
+  song_id: z.string().uuid(),
+  requested_by: z.string().uuid(),
+  position: z.number().int().nonnegative(),
+  status: QueueEntryStatusSchema,
+  idempotency_key: z.string(),
+  created_at: z.string(),
+});
+export type QueueEntry = z.infer<typeof QueueEntrySchema>;
+
 /** Build QR/join URL containing only the origin and room code (never session tokens). */
 export function buildJoinUrl(origin: string, code: string): string {
   const cleanOrigin = origin.replace(/\/+$/, "");
