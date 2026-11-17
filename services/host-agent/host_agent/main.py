@@ -1,13 +1,16 @@
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -18,6 +21,15 @@ from pydantic import BaseModel
 
 from .config import get_config
 from .db import connect_db
+from .separator import (
+    detect_compute_device,
+    has_demucs,
+    run_demucs_separation,
+    verify_stem_integrity,
+)
+
+MIN_FREE_CACHE_BYTES = 200 * 1024 * 1024
+SeparatorFn = Callable[[Path, Path, str, Callable[[], bool]], tuple[Path, Path]]
 
 SUPPORTED_EXTS = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".flac": "audio/flac"}
 DRM_EXTS = {".m4p"}
@@ -144,11 +156,70 @@ class UpdateLyricsRequest(BaseModel):
     source: str = "manual"
 
 
-def create_app(db_conn: sqlite3.Connection | None = None) -> FastAPI:
+class PrepareSongRequest(BaseModel):
+    reprocess: bool = False
+
+
+def _stream_file_range(file_path: Path, mime: str, request: Request) -> StreamingResponse:
+    file_size = file_path.stat().st_size
+    range_header = request.headers.get("range")
+    start = 0
+    end = file_size - 1
+    status_code = 200
+
+    if range_header and range_header.startswith("bytes="):
+        spec = range_header.removeprefix("bytes=").split(",")[0].strip()
+        parts = spec.split("-")
+        if parts[0]:
+            start = int(parts[0])
+        if len(parts) > 1 and parts[1]:
+            end = min(int(parts[1]), file_size - 1)
+        if start > end or start >= file_size:
+            raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+        status_code = 206
+
+    length = end - start + 1
+
+    def iter_file() -> Iterator[bytes]:
+        with file_path.open("rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+    return StreamingResponse(iter_file(), status_code=status_code, media_type=mime, headers=headers)
+
+
+def create_app(
+    db_conn: sqlite3.Connection | None = None,
+    cache_dir: Path | None = None,
+    separator_fn: SeparatorFn | None = None,
+) -> FastAPI:
     cfg = get_config()
     conn = db_conn or connect_db(cfg["db_path"])
+    active_cache_dir = (cache_dir or cfg["cache_dir"]).resolve()
+    stems_root = active_cache_dir / "stems"
+    tmp_root = active_cache_dir / "tmp"
+    stems_root.mkdir(parents=True, exist_ok=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
 
-    app = FastAPI(title="GeeT Host Agent", version="0.2.0")
+    run_separator: SeparatorFn = separator_fn or run_demucs_separation
+    compute_device = detect_compute_device()
+    db_lock = threading.Lock()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="geet-sep")
+
+    app = FastAPI(title="GeeT Host Agent", version="0.3.0")
     origins = list({cfg["app_origin"], "http://localhost:5173", "http://127.0.0.1:5173"})
     app.add_middleware(
         CORSMiddleware,
@@ -164,13 +235,16 @@ def create_app(db_conn: sqlite3.Connection | None = None) -> FastAPI:
 
     @app.get("/health")
     def health():
-        dir_count = conn.execute("SELECT COUNT(*) FROM approved_dirs").fetchone()[0]
-        song_count = conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        with db_lock:
+            dir_count = conn.execute("SELECT COUNT(*) FROM approved_dirs").fetchone()[0]
+            song_count = conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
         return {
             "status": "ok",
             "sqlite": True,
             "ffmpeg": shutil.which("ffmpeg") is not None,
             "ffprobe": shutil.which("ffprobe") is not None,
+            "demucs": has_demucs(),
+            "compute_device": compute_device,
             "approved_dirs": dir_count,
             "song_count": song_count,
         }
@@ -344,24 +418,205 @@ def create_app(db_conn: sqlite3.Connection | None = None) -> FastAPI:
 
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str):
-        row = conn.execute("SELECT id, kind, status, progress, detail FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        with db_lock:
+            row = conn.execute(
+                "SELECT id, kind, song_id, status, progress, detail FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
         return dict(row)
 
     @app.post("/jobs/{job_id}/cancel")
     def cancel_job(job_id: str):
-        row = conn.execute("SELECT id, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Job not found")
-        if row["status"] in ("completed", "failed", "cancelled"):
-            return {"id": job_id, "status": row["status"]}
-        conn.execute(
-            "UPDATE jobs SET cancel_requested = 1, status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
-            (job_id,),
-        )
-        conn.commit()
+        with db_lock:
+            row = conn.execute("SELECT id, kind, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if row["status"] in ("completed", "failed", "cancelled"):
+                return {"id": job_id, "status": row["status"]}
+            if row["kind"] == "separate" and row["status"] == "running":
+                conn.execute(
+                    "UPDATE jobs SET cancel_requested = 1, updated_at = datetime('now') WHERE id = ?",
+                    (job_id,),
+                )
+                conn.commit()
+                return {"id": job_id, "status": "cancelling"}
+            conn.execute(
+                "UPDATE jobs SET cancel_requested = 1, status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
+                (job_id,),
+            )
+            conn.commit()
         return {"id": job_id, "status": "cancelled"}
+
+    def _run_separation_worker(job_id: str, song_id: str, source_path: Path, expected_ms: int) -> None:
+        job_tmp = tmp_root / job_id
+
+        def is_cancelled() -> bool:
+            with db_lock:
+                r = conn.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                return bool(r and r["cancel_requested"])
+
+        final_job_status: str | None = None
+        final_detail: str | None = None
+
+        try:
+            if is_cancelled():
+                final_job_status = "cancelled"
+                return
+
+            job_tmp.mkdir(parents=True, exist_ok=True)
+            with db_lock:
+                conn.execute(
+                    "UPDATE jobs SET status = 'running', progress = 15, detail = ?, updated_at = datetime('now') WHERE id = ?",
+                    (f"device={compute_device}", job_id),
+                )
+                conn.commit()
+
+            inst_tmp, voc_tmp = run_separator(source_path, job_tmp, compute_device, is_cancelled)
+            if is_cancelled():
+                raise RuntimeError("Cancelled")
+
+            verify_stem_integrity(inst_tmp, expected_ms)
+            verify_stem_integrity(voc_tmp, expected_ms)
+
+            # Atomic cache promotion inside stems_root/<song_id>
+            song_stem_dir = stems_root / song_id
+            song_stem_dir.mkdir(parents=True, exist_ok=True)
+            inst_dest = song_stem_dir / "instrumental.wav"
+            voc_dest = song_stem_dir / "vocal.wav"
+            inst_stage = song_stem_dir / f".instrumental.{job_id}.tmp"
+            voc_stage = song_stem_dir / f".vocal.{job_id}.tmp"
+            shutil.copy2(inst_tmp, inst_stage)
+            shutil.copy2(voc_tmp, voc_stage)
+            os.replace(inst_stage, inst_dest)
+            os.replace(voc_stage, voc_dest)
+
+            with db_lock:
+                conn.execute(
+                    """
+                    UPDATE songs
+                    SET readiness = 'ready',
+                        has_instrumental = 1,
+                        instrumental_path = ?,
+                        vocal_path = ?,
+                        updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (str(inst_dest), str(voc_dest), song_id),
+                )
+                conn.commit()
+            final_job_status = "completed"
+            final_detail = f"cached ({compute_device})"
+        except Exception as exc:
+            err_msg = str(exc)
+            was_cancelled = is_cancelled() or err_msg == "Cancelled"
+            final_job_status = "cancelled" if was_cancelled else "failed"
+            final_detail = None if was_cancelled else err_msg[:300]
+        finally:
+            shutil.rmtree(job_tmp, ignore_errors=True)
+            if final_job_status is not None:
+                with db_lock:
+                    if final_job_status == "completed":
+                        conn.execute(
+                            "UPDATE jobs SET status = 'completed', progress = 100, detail = ?, updated_at = datetime('now') WHERE id = ?",
+                            (final_detail, job_id),
+                        )
+                    elif final_job_status == "failed":
+                        conn.execute(
+                            "UPDATE jobs SET status = 'failed', progress = 100, detail = ?, updated_at = datetime('now') WHERE id = ?",
+                            (final_detail, job_id),
+                        )
+                        conn.execute(
+                            "UPDATE songs SET readiness = CASE WHEN has_instrumental = 1 THEN 'ready' ELSE 'failed' END WHERE id = ?",
+                            (song_id,),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE jobs SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
+                            (job_id,),
+                        )
+                        conn.execute(
+                            "UPDATE songs SET readiness = CASE WHEN has_instrumental = 1 THEN 'ready' ELSE 'raw' END WHERE id = ?",
+                            (song_id,),
+                        )
+                    conn.commit()
+
+    @app.post("/songs/{song_id}/prepare")
+    def prepare_song(song_id: str, req: PrepareSongRequest | None = None):
+        reprocess = req.reprocess if req else False
+        with db_lock:
+            song = conn.execute(
+                "SELECT id, file_path, duration_ms, has_instrumental, instrumental_path FROM songs WHERE id = ?",
+                (song_id,),
+            ).fetchone()
+            if not song:
+                raise HTTPException(status_code=404, detail="Song not found")
+
+            source_path = Path(song["file_path"]).resolve()
+            if not _is_within_approved(source_path, _approved_paths()) or not source_path.is_file():
+                raise HTTPException(status_code=403, detail="Source audio file inaccessible")
+
+            if (
+                not reprocess
+                and song["has_instrumental"]
+                and song["instrumental_path"]
+                and Path(song["instrumental_path"]).is_file()
+            ):
+                return {"job_id": None, "song_id": song_id, "status": "ready", "device": compute_device}
+
+            active_job = conn.execute(
+                "SELECT id, status FROM jobs WHERE song_id = ? AND kind = 'separate' AND status IN ('queued', 'running') LIMIT 1",
+                (song_id,),
+            ).fetchone()
+            if active_job:
+                return {
+                    "job_id": active_job["id"],
+                    "song_id": song_id,
+                    "status": active_job["status"],
+                    "device": compute_device,
+                }
+
+            free_bytes = shutil.disk_usage(active_cache_dir).free
+            if free_bytes < MIN_FREE_CACHE_BYTES:
+                raise HTTPException(status_code=507, detail="Insufficient disk space for stem cache")
+
+            job_id = uuid.uuid4().hex[:12]
+            conn.execute(
+                "INSERT INTO jobs (id, kind, song_id, status, progress, detail) VALUES (?, 'separate', ?, 'queued', 0, ?)",
+                (job_id, song_id, f"queued ({compute_device})"),
+            )
+            conn.execute("UPDATE songs SET readiness = 'preparing' WHERE id = ?", (song_id,))
+            conn.commit()
+
+        executor.submit(_run_separation_worker, job_id, song_id, source_path, song["duration_ms"])
+        return {"job_id": job_id, "song_id": song_id, "status": "queued", "device": compute_device}
+
+    @app.post("/songs/{song_id}/cache/clear")
+    def clear_song_cache(song_id: str):
+        with db_lock:
+            song = conn.execute("SELECT id FROM songs WHERE id = ?", (song_id,)).fetchone()
+            if not song:
+                raise HTTPException(status_code=404, detail="Song not found")
+
+            stem_dir = (stems_root / song_id).resolve()
+            if stems_root in stem_dir.parents and stem_dir.exists():
+                shutil.rmtree(stem_dir, ignore_errors=True)
+
+            conn.execute(
+                """
+                UPDATE songs
+                SET has_instrumental = 0,
+                    instrumental_path = NULL,
+                    vocal_path = NULL,
+                    readiness = 'raw',
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (song_id,),
+            )
+            conn.commit()
+        return {"ok": True, "song_id": song_id}
 
     @app.get("/songs/{song_id}/lyrics")
     def get_lyrics(song_id: str):
@@ -485,57 +740,35 @@ def create_app(db_conn: sqlite3.Connection | None = None) -> FastAPI:
         }
 
     @app.get("/media/{song_id}")
-    def stream_media(song_id: str, request: Request):
-        row = conn.execute("SELECT file_path FROM songs WHERE id = ?", (song_id,)).fetchone()
+    def stream_media(
+        song_id: str,
+        request: Request,
+        mode: str = Query(default="original", pattern="^(original|instrumental|vocal)$"),
+    ):
+        with db_lock:
+            row = conn.execute(
+                "SELECT file_path, instrumental_path, vocal_path FROM songs WHERE id = ?",
+                (song_id,),
+            ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Song not found")
 
-        file_path = Path(row["file_path"]).resolve()
-        if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
-            raise HTTPException(status_code=403, detail="Access denied")
+        if mode == "original":
+            file_path = Path(row["file_path"]).resolve()
+            if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
+                raise HTTPException(status_code=403, detail="Access denied")
+            mime = SUPPORTED_EXTS.get(file_path.suffix.lower())
+            if not mime:
+                raise HTTPException(status_code=415, detail="Unsupported media type")
+            return _stream_file_range(file_path, mime, request)
 
-        mime = SUPPORTED_EXTS.get(file_path.suffix.lower())
-        if not mime:
-            raise HTTPException(status_code=415, detail="Unsupported media type")
-
-        file_size = file_path.stat().st_size
-        range_header = request.headers.get("range")
-        start = 0
-        end = file_size - 1
-        status_code = 200
-
-        if range_header and range_header.startswith("bytes="):
-            spec = range_header.removeprefix("bytes=").split(",")[0].strip()
-            parts = spec.split("-")
-            if parts[0]:
-                start = int(parts[0])
-            if len(parts) > 1 and parts[1]:
-                end = min(int(parts[1]), file_size - 1)
-            if start > end or start >= file_size:
-                raise HTTPException(status_code=416, detail="Requested range not satisfiable")
-            status_code = 206
-
-        length = end - start + 1
-
-        def iter_file() -> Iterator[bytes]:
-            with file_path.open("rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
-
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(length),
-        }
-        if status_code == 206:
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-        return StreamingResponse(iter_file(), status_code=status_code, media_type=mime, headers=headers)
+        raw_stem = row["instrumental_path"] if mode == "instrumental" else row["vocal_path"]
+        if not raw_stem:
+            raise HTTPException(status_code=404, detail=f"{mode} stem not prepared")
+        stem_path = Path(raw_stem).resolve()
+        if not _is_within_approved(stem_path, [stems_root]) or not stem_path.is_file():
+            raise HTTPException(status_code=404, detail=f"{mode} stem missing")
+        return _stream_file_range(stem_path, "audio/wav", request)
 
     return app
 

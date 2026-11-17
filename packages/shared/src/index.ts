@@ -9,11 +9,16 @@ export const SongReadinessSchema = z.enum([
 ]);
 export type SongReadiness = z.infer<typeof SongReadinessSchema>;
 
+export const AudioModeSchema = z.enum(["original", "instrumental", "vocal"]);
+export type AudioMode = z.infer<typeof AudioModeSchema>;
+
 export const HostHealthSchema = z.object({
   status: z.literal("ok"),
   sqlite: z.boolean(),
   ffmpeg: z.boolean(),
   ffprobe: z.boolean(),
+  demucs: z.boolean().optional(),
+  compute_device: z.enum(["cuda", "mps", "cpu"]).optional(),
   approved_dirs: z.number().int().nonnegative(),
   song_count: z.number().int().nonnegative(),
 });
@@ -45,6 +50,7 @@ export type JobStatus = z.infer<typeof JobStatusSchema>;
 export const JobSchema = z.object({
   id: z.string(),
   kind: z.string(),
+  song_id: z.string().nullable().optional(),
   status: JobStatusSchema,
   progress: z.number().min(0).max(100),
   detail: z.string().nullable().optional(),

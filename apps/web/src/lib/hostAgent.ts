@@ -1,18 +1,22 @@
 import {
   HostHealthSchema,
   HostSongSchema,
+  JobSchema,
   LyricsRecordSchema,
   SongPageSchema,
+  type AudioMode,
   type HostHealth,
   type HostSong,
+  type Job,
   type LyricsRecord,
   type SongPage,
 } from "@geet/shared";
 
 const BASE_URL = (import.meta.env.VITE_HOST_AGENT_URL as string | undefined) ?? "http://127.0.0.1:8765";
 
-export function mediaUrl(songId: string): string {
-  return `${BASE_URL}/media/${encodeURIComponent(songId)}`;
+export function mediaUrl(songId: string, mode: AudioMode = "original"): string {
+  const base = `${BASE_URL}/media/${encodeURIComponent(songId)}`;
+  return mode === "original" ? base : `${base}?mode=${encodeURIComponent(mode)}`;
 }
 
 export async function fetchHostHealth(): Promise<HostHealth> {
@@ -92,4 +96,41 @@ export async function lookupLyrics(
   });
   if (!res.ok) throw new Error(`LRCLIB lookup failed: ${res.status}`);
   return res.json();
+}
+
+export async function prepareSong(
+  songId: string,
+  reprocess = false
+): Promise<{ job_id: string | null; song_id: string; status: string; device: string }> {
+  const res = await fetch(`${BASE_URL}/songs/${encodeURIComponent(songId)}/prepare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reprocess }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `Prepare failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchJob(jobId: string): Promise<Job> {
+  const res = await fetch(`${BASE_URL}/jobs/${encodeURIComponent(jobId)}`);
+  if (!res.ok) throw new Error(`Fetch job failed: ${res.status}`);
+  return JobSchema.parse(await res.json());
+}
+
+export async function cancelJob(jobId: string): Promise<{ id: string; status: string }> {
+  const res = await fetch(`${BASE_URL}/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Cancel job failed: ${res.status}`);
+  return res.json();
+}
+
+export async function clearSongCache(songId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/songs/${encodeURIComponent(songId)}/cache/clear`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Clear cache failed: ${res.status}`);
 }

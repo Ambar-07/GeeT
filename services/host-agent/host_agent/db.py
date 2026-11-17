@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS songs (
     readiness TEXT NOT NULL DEFAULT 'raw',
     has_lyrics INTEGER NOT NULL DEFAULT 0,
     has_instrumental INTEGER NOT NULL DEFAULT 0,
+    instrumental_path TEXT,
+    vocal_path TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -31,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_songs_title_id ON songs(title, id);
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
+    song_id TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     progress INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -50,17 +53,11 @@ CREATE TABLE IF NOT EXISTS lyrics (
 """
 
 
-def _ensure_song_columns(conn: sqlite3.Connection) -> None:
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(songs)").fetchall()}
-    migrations = {
-        "size_bytes": "INTEGER NOT NULL DEFAULT 0",
-        "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
-        "content_hash": "TEXT",
-        "duplicate_of": "TEXT",
-    }
+def _ensure_columns(conn: sqlite3.Connection, table: str, migrations: dict[str, str]) -> None:
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     for name, ddl in migrations.items():
         if name not in cols:
-            conn.execute(f"ALTER TABLE songs ADD COLUMN {name} {ddl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
@@ -68,7 +65,19 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.executescript(SCHEMA_SQL)
-    _ensure_song_columns(conn)
+    _ensure_columns(
+        conn,
+        "songs",
+        {
+            "size_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+            "content_hash": "TEXT",
+            "duplicate_of": "TEXT",
+            "instrumental_path": "TEXT",
+            "vocal_path": "TEXT",
+        },
+    )
+    _ensure_columns(conn, "jobs", {"song_id": "TEXT"})
     conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_content_hash ON songs(content_hash);")
     conn.commit()
     return conn

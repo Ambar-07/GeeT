@@ -1,5 +1,7 @@
 import hashlib
 import sqlite3
+import threading
+import time
 import wave
 from pathlib import Path
 
@@ -17,11 +19,11 @@ def _make_wav(path: Path, frames: int = 800) -> None:
         w.writeframes(b"\x01\x02" * frames)
 
 
-def _client() -> TestClient:
+def _client(cache_dir: Path | None = None, separator_fn=None) -> TestClient:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
-    return TestClient(create_app(db_conn=conn))
+    return TestClient(create_app(db_conn=conn, cache_dir=cache_dir, separator_fn=separator_fn))
 
 
 def test_health_and_media_range(tmp_path: Path):
@@ -160,3 +162,111 @@ def test_lyrics_sidecar_validation_and_10_timed_songs(tmp_path: Path):
         ).json()
         assert saved["synchronized_ready"] is True
         assert saved["offset_ms"] == -500
+
+
+def _wait_job(client: TestClient, job_id: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = client.get(f"/jobs/{job_id}").json()
+        if job["status"] in ("completed", "failed", "cancelled"):
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"Job {job_id} did not finish in time")
+
+
+def test_instrumental_separation_cache_clear_and_original_preserved(tmp_path: Path):
+    music_dir = tmp_path / "sep_music"
+    cache_dir = tmp_path / "sep_cache"
+    music_dir.mkdir()
+    src = music_dir / "ballad.wav"
+    _make_wav(src, frames=8000)
+    orig_mtime = src.stat().st_mtime_ns
+    orig_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+
+    def test_separator(source_path: Path, job_tmp: Path, device: str, cancel_check):
+        assert device in ("cpu", "cuda", "mps")
+        assert source_path.resolve() == src.resolve()
+        inst = job_tmp / "no_vocals.wav"
+        voc = job_tmp / "vocals.wav"
+        _make_wav(inst, frames=8000)
+        _make_wav(voc, frames=8000)
+        return inst, voc
+
+    client = _client(cache_dir=cache_dir, separator_fn=test_separator)
+    client.post("/library/select", json={"path": str(music_dir)})
+    client.post("/library/scan")
+    song_id = client.get("/library/songs").json()["songs"][0]["id"]
+
+    prep = client.post(f"/songs/{song_id}/prepare").json()
+    assert prep["status"] == "queued"
+    job = _wait_job(client, prep["job_id"])
+    assert job["status"] == "completed"
+
+    # Song is ready and both instrumental & vocal preview stream with range support
+    detail = client.get(f"/library/songs/{song_id}").json()
+    assert detail["readiness"] == "ready"
+    assert detail["has_instrumental"] is True
+
+    inst_res = client.get(f"/media/{song_id}?mode=instrumental", headers={"Range": "bytes=0-63"})
+    assert inst_res.status_code == 206
+    assert len(inst_res.content) == 64
+
+    voc_res = client.get(f"/media/{song_id}?mode=vocal")
+    assert voc_res.status_code == 200
+    assert len(voc_res.content) > 44
+
+    # Original file remains untouched
+    assert src.stat().st_mtime_ns == orig_mtime
+    assert hashlib.sha256(src.read_bytes()).hexdigest() == orig_sha
+
+    # Clear cache removes stems without touching original
+    assert client.post(f"/songs/{song_id}/cache/clear").status_code == 200
+    assert client.get(f"/media/{song_id}?mode=instrumental").status_code == 404
+    assert client.get(f"/media/{song_id}?mode=original").status_code == 200
+    assert src.exists() and hashlib.sha256(src.read_bytes()).hexdigest() == orig_sha
+
+
+def test_separation_cancellation_and_failure_preserve_original(tmp_path: Path):
+    music_dir = tmp_path / "fail_music"
+    cache_dir = tmp_path / "fail_cache"
+    music_dir.mkdir()
+    src = music_dir / "track.wav"
+    _make_wav(src, frames=8000)
+
+    started = threading.Event()
+
+    def slow_separator(source_path: Path, job_tmp: Path, device: str, cancel_check):
+        started.set()
+        while not cancel_check():
+            time.sleep(0.02)
+        raise RuntimeError("Cancelled")
+
+    client = _client(cache_dir=cache_dir, separator_fn=slow_separator)
+    client.post("/library/select", json={"path": str(music_dir)})
+    client.post("/library/scan")
+    song_id = client.get("/library/songs").json()["songs"][0]["id"]
+
+    prep = client.post(f"/songs/{song_id}/prepare").json()
+    assert started.wait(timeout=2.0)
+    cancel_res = client.post(f"/jobs/{prep['job_id']}/cancel").json()
+    assert cancel_res["status"] in ("cancelled", "cancelling")
+    job = _wait_job(client, prep["job_id"])
+    assert job["status"] == "cancelled"
+
+    # Temp dirs are cleaned and original still plays
+    assert list((cache_dir / "tmp").iterdir()) == []
+    assert client.get(f"/media/{song_id}").status_code == 200
+
+    # Failure path (default separator when Demucs is absent or raises)
+    def failing_separator(*_args):
+        raise RuntimeError("Demucs not installed")
+
+    fail_client = _client(cache_dir=cache_dir, separator_fn=failing_separator)
+    fail_client.post("/library/select", json={"path": str(music_dir)})
+    fail_client.post("/library/scan")
+    fail_sid = fail_client.get("/library/songs").json()["songs"][0]["id"]
+    fail_prep = fail_client.post(f"/songs/{fail_sid}/prepare").json()
+    fail_job = _wait_job(fail_client, fail_prep["job_id"])
+    assert fail_job["status"] == "failed"
+    assert fail_client.get(f"/library/songs/{fail_sid}").json()["readiness"] == "failed"
+    assert fail_client.get(f"/media/{fail_sid}").status_code == 200
