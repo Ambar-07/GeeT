@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { Logo } from "../components/Brand";
+import { Cover, displayTitle } from "../components/Cover";
 import {
   addSongToQueue,
   ensureAuthSession,
@@ -25,7 +27,7 @@ export function RoomPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [onlineIds, setOnlineIds] = useState<string[]>([]);
-  const [connState, setConnState] = useState<"idle" | "connecting" | "subscribed" | "disconnected">("idle");
+  const [, setConnState] = useState<"idle" | "connecting" | "subscribed" | "disconnected">("idle");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -34,13 +36,11 @@ export function RoomPage() {
 
   const sendReactionRef = useRef<((label: string) => void) | null>(null);
 
-  // Debounce search input to keep read/UI work minimal
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim().toLowerCase()), 250);
     return () => clearTimeout(t);
   }, [search]);
 
-  // Attempt automatic session restore if user already authenticated and joined this room
   useEffect(() => {
     if (!isSupabaseConfigured || !normalizedCode) return;
     let active = true;
@@ -53,7 +53,7 @@ export function RoomPage() {
           setRoomId(existingId);
         }
       } catch {
-        // User has not joined yet; wait for explicit join form submission
+        // Wait for explicit join form submission
       }
     })();
     return () => {
@@ -61,7 +61,6 @@ export function RoomPage() {
     };
   }, [normalizedCode]);
 
-  // Subscribe to Realtime while room is active; unsubscribe on exit
   useEffect(() => {
     if (!roomId || !userId || !isSupabaseConfigured) return;
     let active = true;
@@ -179,191 +178,227 @@ export function RoomPage() {
 
   if (!isSupabaseConfigured) {
     return (
-      <main className="mx-auto flex min-h-screen max-w-xl flex-col justify-center gap-6 px-6 py-12">
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-          <h1 className="text-xl font-bold">Room {normalizedCode}</h1>
-          <p className="mt-2 text-sm text-amber-400">
-            Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.
-          </p>
-          <Link to="/" className="mt-4 inline-block text-sm text-indigo-400 hover:underline">
-            Back to Home
-          </Link>
-        </div>
-      </main>
+      <div className="stage-ambient min-h-screen text-snow">
+        <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
+          <div className="surface p-7 space-y-5">
+            <Logo size={26} suffix="Room" />
+            <div>
+              <p className="eyebrow">Room Code</p>
+              <h1 className="mt-1 font-mono text-2xl font-bold tracking-wider text-snow">
+                {normalizedCode}
+              </h1>
+            </div>
+            <p role="status" className="text-xs leading-relaxed text-snow/60">
+              Cloud room sync is offline on this host. Open the Host Console to play and sing locally.
+            </p>
+            <div className="flex gap-2.5 pt-1">
+              <Link to="/host" className="btn-primary px-5 py-2 text-xs">
+                Open Host Console
+              </Link>
+              <Link to="/" className="btn-ghost px-5 py-2 text-xs">
+                Back to Home
+              </Link>
+            </div>
+          </div>
+        </main>
+      </div>
     );
   }
 
   if (!roomId) {
     return (
-      <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 space-y-4">
-          <div>
-            <p className="text-xs uppercase tracking-wider text-indigo-400">Join Room</p>
-            <h1 className="mt-1 font-mono text-2xl font-bold">{normalizedCode}</h1>
+      <div className="stage-ambient min-h-screen text-snow">
+        <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
+          <div className="surface p-7 space-y-5">
+            <Logo size={26} suffix="Join" />
+            <div>
+              <p className="eyebrow">Room Code</p>
+              <h1 className="mt-1 font-mono text-2xl font-bold tracking-wider text-snow">
+                {normalizedCode}
+              </h1>
+            </div>
+            <form onSubmit={handleJoin} className="space-y-3">
+              <input
+                aria-label="Your display name"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder="Your display name"
+                maxLength={40}
+                className="field"
+              />
+              <button
+                type="submit"
+                disabled={joining || !displayName.trim()}
+                className="btn-primary w-full py-2.5 text-sm"
+              >
+                {joining ? "Joining..." : "Enter Room"}
+              </button>
+            </form>
+            {error && (
+              <p role="alert" className="text-xs text-pink">
+                {error}
+              </p>
+            )}
+            <Link to="/" className="inline-block text-xs text-snow/50 hover:text-snow">
+              Back to Home
+            </Link>
           </div>
-          <form onSubmit={handleJoin} className="space-y-3">
-            <input
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Your display name"
-              maxLength={40}
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-indigo-500"
-            />
-            <button
-              type="submit"
-              disabled={joining || !displayName.trim()}
-              className="w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
-            >
-              {joining ? "Joining..." : "Enter Room"}
-            </button>
-          </form>
-          {error && <p className="text-xs text-rose-400">{error}</p>}
-          <Link to="/" className="inline-block text-xs text-slate-400 hover:text-slate-200">
-            Back to Home
-          </Link>
-        </div>
-      </main>
+        </main>
+      </div>
     );
   }
 
   return (
-    <main className="mx-auto max-w-2xl space-y-6 px-6 py-8">
-      <header className="flex items-center justify-between">
-        <div>
-          <p className="text-xs uppercase tracking-wider text-indigo-400">
-            Room {normalizedCode} • {connState} {snapshot ? `• Rev ${snapshot.room.revision}` : ""}
-          </p>
-          <h1 className="text-xl font-bold">
-            {snapshot ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)` : "Loading..."}
-          </h1>
-        </div>
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => void handleManualSync()}
-            className="text-xs text-indigo-400 hover:underline"
-          >
-            Sync
-          </button>
-          <Link to="/" className="text-sm text-slate-400 hover:text-slate-200">
-            Leave
-          </Link>
-        </div>
-      </header>
-
-      {snapshot?.room.status === "host_disconnected" && (
-        <div className="rounded-lg border border-amber-700 bg-amber-950/60 p-3 text-xs text-amber-200">
-          Host is temporarily disconnected. Waiting for host to reconnect.
-        </div>
-      )}
-
-      {snapshot?.room.status === "closed" && (
-        <div className="rounded-lg border border-rose-800 bg-rose-950/60 p-3 text-xs text-rose-200">
-          This room has been closed by the host.
-        </div>
-      )}
-
-      {playingSong && (
-        <section className="rounded-xl border border-indigo-500/40 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wider text-indigo-400">
-            Now Playing ({snapshot?.playback?.status ?? "playing"})
-          </p>
-          <p className="mt-1 text-base font-semibold">
-            {playingSong.title} {playingSong.artist ? `— ${playingSong.artist}` : ""}
-          </p>
-        </section>
-      )}
-
-      <section className="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-2">
-        <h2 className="text-sm font-semibold text-slate-300">
-          Up Next ({queuedEntries.length})
-        </h2>
-        {queuedEntries.length === 0 ? (
-          <p className="text-xs text-slate-500">Queue is empty. Add a song from the catalogue below.</p>
-        ) : (
-          <ul className="divide-y divide-slate-800">
-            {queuedEntries.map((entry, idx) => {
-              const s = songMap.get(entry.song_id);
-              const requester = participantMap.get(entry.requested_by) ?? "Member";
-              const isMine = entry.requested_by === userId;
-              return (
-                <li key={entry.id} className="flex items-center justify-between py-2 text-xs">
-                  <div>
-                    <span className="mr-2 text-slate-500">{idx + 1}.</span>
-                    <span className="font-medium text-slate-200">{s?.title ?? "Song"}</span>
-                    <span className="ml-2 text-slate-400">({requester})</span>
-                  </div>
-                  {isMine && (
-                    <button
-                      type="button"
-                      disabled={queueBusyId === entry.id}
-                      onClick={() => void handleRemoveOwnEntry(entry.id)}
-                      className="rounded border border-rose-900 px-2 py-0.5 text-rose-300 hover:bg-rose-950 disabled:opacity-40"
-                    >
-                      Remove
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
-
-      <section className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <span className="text-xs font-medium text-slate-400">Send Reaction (2s limit)</span>
-        <div className="flex gap-2">
-          {["Clap", "Encore", "Cheer"].map((label) => (
-            <button
-              key={label}
-              type="button"
-              onClick={() => sendReactionRef.current?.(label)}
-              className="rounded-lg border border-slate-700 px-3 py-1 text-xs hover:bg-indigo-600"
-            >
-              {label}
+    <div className="min-h-screen bg-ink-950 text-snow">
+      <main className="mx-auto max-w-2xl space-y-5 px-5 py-7">
+        <header className="surface flex flex-wrap items-center justify-between gap-4 px-5 py-4">
+          <div className="flex items-center gap-3">
+            <Logo size={26} />
+            <div>
+              <p className="eyebrow text-sky">Room {normalizedCode}</p>
+              <h1 className="text-base font-semibold text-snow">
+                {snapshot ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)` : "Loading..."}
+              </h1>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => void handleManualSync()} className="btn-ghost px-3.5 py-1.5 text-xs">
+              Sync
             </button>
-          ))}
-        </div>
-      </section>
+            <Link to="/" className="btn-ghost px-3.5 py-1.5 text-xs">
+              Leave
+            </Link>
+          </div>
+        </header>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold text-slate-300">
-            Room Catalogue ({filteredSongs.length})
-          </h2>
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search songs..."
-            className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1 text-xs outline-none focus:border-indigo-500"
-          />
-        </div>
-
-        {filteredSongs.length === 0 ? (
-          <p className="text-xs text-slate-500">No songs published by the host yet.</p>
-        ) : (
-          <ul className="divide-y divide-slate-800">
-            {filteredSongs.map((song) => (
-              <li key={song.id} className="flex items-center justify-between py-2 text-sm">
-                <div>
-                  <span className="font-medium">{song.title}</span>
-                  {song.artist && <span className="ml-2 text-xs text-slate-400">{song.artist}</span>}
-                </div>
-                <button
-                  type="button"
-                  disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
-                  onClick={() => void handleQueueSong(song.id)}
-                  className="rounded-md bg-slate-800 px-3 py-1 text-xs font-medium hover:bg-indigo-600 disabled:opacity-40"
-                >
-                  {queueBusyId === song.id ? "Queuing..." : "Queue"}
-                </button>
-              </li>
-            ))}
-          </ul>
+        {snapshot?.room.status === "host_disconnected" && (
+          <div role="status" className="surface border-pink/40 p-3.5 text-xs text-pink">
+            Host is temporarily paused. Waiting for host to resume.
+          </div>
         )}
-      </section>
 
-      {error && <p className="text-xs text-rose-400">{error}</p>}
-    </main>
+        {snapshot?.room.status === "closed" && (
+          <div role="alert" className="surface border-pink/60 p-3.5 text-xs text-pink">
+            This room has ended.
+          </div>
+        )}
+
+        {playingSong && (
+          <section className="surface stage-ambient flex items-center gap-4 p-5">
+            <Cover title={playingSong.title} size={48} className="rounded-xl" />
+            <div>
+              <p className="eyebrow text-sky">
+                Now Playing ({snapshot?.playback?.status ?? "playing"})
+              </p>
+              <p className="mt-0.5 text-base font-bold text-snow">
+                {displayTitle(playingSong.title)}{" "}
+                {playingSong.artist ? `— ${playingSong.artist}` : ""}
+              </p>
+            </div>
+          </section>
+        )}
+
+        <section className="surface p-5 space-y-3">
+          <h2 className="text-sm font-semibold text-snow">Up Next ({queuedEntries.length})</h2>
+          {queuedEntries.length === 0 ? (
+            <p className="text-xs text-snow/45">Queue is empty. Pick a song below.</p>
+          ) : (
+            <ul className="divide-y divide-white/6">
+              {queuedEntries.map((entry, idx) => {
+                const s = songMap.get(entry.song_id);
+                const requester = participantMap.get(entry.requested_by) ?? "Guest";
+                const isMine = entry.requested_by === userId;
+                return (
+                  <li key={entry.id} className="flex items-center justify-between py-2.5 text-xs">
+                    <div>
+                      <span className="mr-2 font-mono text-snow/45">{idx + 1}.</span>
+                      <span className="font-semibold text-snow">
+                        {s ? displayTitle(s.title) : "Song"}
+                      </span>
+                      <span className="ml-2 text-snow/50">({requester})</span>
+                    </div>
+                    {isMine && (
+                      <button
+                        type="button"
+                        disabled={queueBusyId === entry.id}
+                        onClick={() => void handleRemoveOwnEntry(entry.id)}
+                        className="text-xs font-medium text-pink hover:underline disabled:opacity-40"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+
+        <section className="surface flex flex-wrap items-center justify-between gap-3 p-5">
+          <span className="text-xs font-medium text-snow/60">Send Reaction</span>
+          <div className="flex gap-2">
+            {["Clap", "Encore", "Cheer"].map((label) => (
+              <button
+                key={label}
+                type="button"
+                onClick={() => sendReactionRef.current?.(label)}
+                className="btn-ghost px-4 py-1.5 text-xs"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="surface p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-snow">
+              Room Catalogue ({filteredSongs.length})
+            </h2>
+            <input
+              aria-label="Search room songs"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search songs..."
+              className="field max-w-xs py-1.5 text-xs"
+            />
+          </div>
+
+          {filteredSongs.length === 0 ? (
+            <p className="text-xs text-snow/45">No songs published by the host yet.</p>
+          ) : (
+            <ul className="divide-y divide-white/6">
+              {filteredSongs.map((song) => (
+                <li key={song.id} className="flex items-center justify-between gap-3 py-2.5 text-sm">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <Cover title={song.title} size={36} className="rounded-lg" />
+                    <div className="min-w-0">
+                      <p className="truncate font-medium text-snow">{displayTitle(song.title)}</p>
+                      {song.artist && (
+                        <p className="truncate text-xs text-snow/50">{song.artist}</p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
+                    onClick={() => void handleQueueSong(song.id)}
+                    className="btn-primary shrink-0 px-4 py-1 text-xs"
+                  >
+                    {queueBusyId === song.id ? "Queuing..." : "Queue"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {error && (
+          <p role="alert" className="text-xs text-pink">
+            {error}
+          </p>
+        )}
+      </main>
+    </div>
   );
 }

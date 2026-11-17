@@ -134,3 +134,9 @@ export async function clearSongCache(songId: string): Promise<void> {
   });
   if (!res.ok) throw new Error(`Clear cache failed: ${res.status}`);
 }
+
+export async function backupMetadata(): Promise<{ ok: boolean; filename: string; size_bytes: number }> {
+  const res = await fetch(`${BASE_URL}/backup`, { method: "POST" });
+  if (!res.ok) throw new Error(`Backup failed: ${res.status}`);
+  return res.json();
+}

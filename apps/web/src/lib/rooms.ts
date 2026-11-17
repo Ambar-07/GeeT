@@ -27,6 +27,24 @@ export interface RoomSnapshot {
 const CAP_STORAGE_PREFIX = "geet_host_cap_";
 const ROOM_SELECT_COLS = "id, code, host_user_id, status, revision, created_at, expires_at";
 
+export interface QuotaTelemetry {
+  activeChannels: number;
+  realtimeMessages: number;
+  snapshotFetches: number;
+  lastError: string | null;
+}
+
+const telemetry: QuotaTelemetry = {
+  activeChannels: 0,
+  realtimeMessages: 0,
+  snapshotFetches: 0,
+  lastError: null,
+};
+
+export function getQuotaTelemetry(): QuotaTelemetry {
+  return { ...telemetry };
+}
+
 function requireSupabase() {
   if (!supabase) throw new Error("Supabase is not configured.");
   return supabase;
@@ -144,6 +162,7 @@ export async function fetchRoomIdByCode(code: string): Promise<string | null> {
 
 export async function fetchRoomSnapshot(roomId: string): Promise<RoomSnapshot> {
   const client = requireSupabase();
+  telemetry.snapshotFetches += 1;
   const [roomRes, partRes, songsRes, queueRes, pbRes] = await Promise.all([
     client.from("rooms").select(ROOM_SELECT_COLS).eq("id", roomId).single(),
     client.from("room_participants").select("*").eq("room_id", roomId).is("revoked_at", null),
@@ -288,16 +307,19 @@ export function subscribeToRoom(
   let lastReactionAt = 0;
 
   const refresh = async (force = false) => {
+    telemetry.realtimeMessages += 1;
     try {
       const snap = await fetchRoomSnapshot(roomId);
+      telemetry.lastError = null;
       callbacks.onSnapshot(snap);
       void force;
-    } catch {
-      // Transient fetch failure during reconnect will retry on next event or manual sync
+    } catch (err) {
+      telemetry.lastError = err instanceof Error ? err.message : "Snapshot sync error";
     }
   };
 
   callbacks.onConnectionState("connecting");
+  telemetry.activeChannels += 1;
   const channel: RealtimeChannel = client.channel(`room:${roomId}`, {
     config: { presence: { key: userId } },
   });
@@ -333,6 +355,7 @@ export function subscribeToRoom(
       callbacks.onPresenceCount(Object.keys(state));
     })
     .on("broadcast", { event: "reaction" }, ({ payload }) => {
+      telemetry.realtimeMessages += 1;
       if (payload?.sender && payload?.label) {
         callbacks.onReaction({ sender: String(payload.sender), label: String(payload.label) });
       }
@@ -353,6 +376,7 @@ export function subscribeToRoom(
       // Client-side rate limit: max 1 reaction every 2000ms to protect Realtime message quota
       if (now - lastReactionAt < 2000) return;
       lastReactionAt = now;
+      telemetry.realtimeMessages += 1;
       void channel.send({
         type: "broadcast",
         event: "reaction",
@@ -360,6 +384,7 @@ export function subscribeToRoom(
       });
     },
     unsubscribe() {
+      telemetry.activeChannels = Math.max(0, telemetry.activeChannels - 1);
       void client.removeChannel(channel);
     },
   };

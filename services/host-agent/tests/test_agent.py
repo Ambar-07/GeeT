@@ -19,11 +19,19 @@ def _make_wav(path: Path, frames: int = 800) -> None:
         w.writeframes(b"\x01\x02" * frames)
 
 
-def _client(cache_dir: Path | None = None, separator_fn=None) -> TestClient:
+def _client(cache_dir: Path | None = None, separator_fn=None, data_dir: Path | None = None, auth_token: str | None = None) -> TestClient:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
-    return TestClient(create_app(db_conn=conn, cache_dir=cache_dir, separator_fn=separator_fn))
+    return TestClient(
+        create_app(
+            db_conn=conn,
+            cache_dir=cache_dir,
+            separator_fn=separator_fn,
+            data_dir=data_dir,
+            auth_token=auth_token,
+        )
+    )
 
 
 def test_health_and_media_range(tmp_path: Path):
@@ -270,3 +278,44 @@ def test_separation_cancellation_and_failure_preserve_original(tmp_path: Path):
     assert fail_job["status"] == "failed"
     assert fail_client.get(f"/library/songs/{fail_sid}").json()["readiness"] == "failed"
     assert fail_client.get(f"/media/{fail_sid}").status_code == 200
+
+
+def test_hardening_auth_token_traversal_and_sqlite_backup(tmp_path: Path):
+    music_dir = tmp_path / "sec_music"
+    data_dir = tmp_path / "sec_data"
+    cache_dir = tmp_path / "sec_cache"
+    music_dir.mkdir()
+    _make_wav(music_dir / "clean.wav", frames=800)
+
+    client = _client(cache_dir=cache_dir, data_dir=data_dir, auth_token="local-secret-123")
+
+    # Mutating endpoints require X-Host-Token when configured
+    assert client.post("/library/select", json={"path": str(music_dir)}).status_code == 401
+    assert (
+        client.post(
+            "/library/select",
+            json={"path": str(music_dir)},
+            headers={"X-Host-Token": "local-secret-123"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post("/library/scan", headers={"X-Host-Token": "local-secret-123"}).json()["scanned"]
+        == 1
+    )
+
+    # Path traversal / malformed song ID rejected cleanly
+    assert client.get("/media/..%2F..%2Fetc%2Fpasswd").status_code in (400, 404)
+    assert client.get("/media/not-a-valid-hex-id").status_code == 400
+
+    # Atomic SQLite backup creates readable metadata backup without audio files
+    backup = client.post("/backup", headers={"X-Host-Token": "local-secret-123"})
+    assert backup.status_code == 200
+    backup_file = data_dir / "backups" / backup.json()["filename"]
+    assert backup_file.is_file()
+    bconn = sqlite3.connect(backup_file)
+    try:
+        count = bconn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        assert count == 1
+    finally:
+        bconn.close()

@@ -14,4 +14,5 @@ def get_config() -> dict:
         "cache_dir": cache_dir,
         "db_path": data_dir / "host_agent.sqlite3",
         "app_origin": os.getenv("APP_ORIGIN", "http://localhost:5173"),
+        "auth_token": os.getenv("HOST_AUTH_TOKEN", ""),
     }

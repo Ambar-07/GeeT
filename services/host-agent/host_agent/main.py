@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -9,11 +10,12 @@ import subprocess
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from mutagen import File as MutagenFile
@@ -205,29 +207,39 @@ def create_app(
     db_conn: sqlite3.Connection | None = None,
     cache_dir: Path | None = None,
     separator_fn: SeparatorFn | None = None,
+    data_dir: Path | None = None,
+    auth_token: str | None = None,
 ) -> FastAPI:
     cfg = get_config()
     conn = db_conn or connect_db(cfg["db_path"])
     active_cache_dir = (cache_dir or cfg["cache_dir"]).resolve()
+    active_data_dir = (data_dir or cfg["data_dir"]).resolve()
+    active_token = cfg["auth_token"] if auth_token is None else auth_token
     stems_root = active_cache_dir / "stems"
     tmp_root = active_cache_dir / "tmp"
+    backups_root = active_data_dir / "backups"
     stems_root.mkdir(parents=True, exist_ok=True)
     tmp_root.mkdir(parents=True, exist_ok=True)
+    backups_root.mkdir(parents=True, exist_ok=True)
 
     run_separator: SeparatorFn = separator_fn or run_demucs_separation
     compute_device = detect_compute_device()
     db_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="geet-sep")
 
-    app = FastAPI(title="GeeT Host Agent", version="0.3.0")
+    app = FastAPI(title="GeeT Host Agent", version="0.4.0")
     origins = list({cfg["app_origin"], "http://localhost:5173", "http://127.0.0.1:5173"})
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
         allow_methods=["GET", "POST", "PUT", "OPTIONS"],
-        allow_headers=["Content-Type", "Range"],
+        allow_headers=["Content-Type", "Range", "X-Host-Token"],
         expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
     )
+
+    def _require_host_token(x_host_token: str | None = Header(default=None)) -> None:
+        if active_token and not hmac.compare_digest(x_host_token or "", active_token):
+            raise HTTPException(status_code=401, detail="Invalid or missing host token")
 
     def _approved_paths() -> list[Path]:
         rows = conn.execute("SELECT path FROM approved_dirs").fetchall()
@@ -245,11 +257,12 @@ def create_app(
             "ffprobe": shutil.which("ffprobe") is not None,
             "demucs": has_demucs(),
             "compute_device": compute_device,
+            "auth_required": bool(active_token),
             "approved_dirs": dir_count,
             "song_count": song_count,
         }
 
-    @app.post("/library/select")
+    @app.post("/library/select", dependencies=[Depends(_require_host_token)])
     def select_library(req: SelectLibraryRequest):
         target = Path(req.path).expanduser().resolve()
         if not target.exists() or not target.is_dir():
@@ -258,7 +271,7 @@ def create_app(
         conn.commit()
         return {"ok": True, "approved_dirs": len(_approved_paths())}
 
-    @app.post("/library/scan")
+    @app.post("/library/scan", dependencies=[Depends(_require_host_token)])
     def scan_library():
         job_id = uuid.uuid4().hex[:12]
         conn.execute("INSERT INTO jobs (id, kind, status, progress) VALUES (?, 'scan', 'running', 0)", (job_id,))
@@ -427,7 +440,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Job not found")
         return dict(row)
 
-    @app.post("/jobs/{job_id}/cancel")
+    @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(_require_host_token)])
     def cancel_job(job_id: str):
         with db_lock:
             row = conn.execute("SELECT id, kind, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -542,7 +555,7 @@ def create_app(
                         )
                     conn.commit()
 
-    @app.post("/songs/{song_id}/prepare")
+    @app.post("/songs/{song_id}/prepare", dependencies=[Depends(_require_host_token)])
     def prepare_song(song_id: str, req: PrepareSongRequest | None = None):
         reprocess = req.reprocess if req else False
         with db_lock:
@@ -592,7 +605,7 @@ def create_app(
         executor.submit(_run_separation_worker, job_id, song_id, source_path, song["duration_ms"])
         return {"job_id": job_id, "song_id": song_id, "status": "queued", "device": compute_device}
 
-    @app.post("/songs/{song_id}/cache/clear")
+    @app.post("/songs/{song_id}/cache/clear", dependencies=[Depends(_require_host_token)])
     def clear_song_cache(song_id: str):
         with db_lock:
             song = conn.execute("SELECT id FROM songs WHERE id = ?", (song_id,)).fetchone()
@@ -666,7 +679,7 @@ def create_app(
             "synchronized_ready": False,
         }
 
-    @app.put("/songs/{song_id}/lyrics")
+    @app.put("/songs/{song_id}/lyrics", dependencies=[Depends(_require_host_token)])
     def put_lyrics(song_id: str, req: UpdateLyricsRequest):
         if not conn.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Song not found")
@@ -695,7 +708,7 @@ def create_app(
             "synchronized_ready": sync_ready,
         }
 
-    @app.post("/songs/{song_id}/lyrics/lookup")
+    @app.post("/songs/{song_id}/lyrics/lookup", dependencies=[Depends(_require_host_token)])
     def lookup_lrclib(song_id: str):
         song = conn.execute(
             "SELECT title, artist, album, duration_ms FROM songs WHERE id = ?", (song_id,)
@@ -739,12 +752,29 @@ def create_app(
             "reason": None if synced else "Only unsynced lyrics found",
         }
 
+    @app.post("/backup", dependencies=[Depends(_require_host_token)])
+    def backup_metadata():
+        """Create an atomic SQLite metadata and lyrics backup (never includes audio files)."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        dest_path = (backups_root / f"host_agent-{stamp}.sqlite3").resolve()
+        if backups_root not in dest_path.parents:
+            raise HTTPException(status_code=400, detail="Invalid backup destination")
+        with db_lock:
+            dest_conn = sqlite3.connect(dest_path)
+            try:
+                conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        return {"ok": True, "filename": dest_path.name, "size_bytes": dest_path.stat().st_size}
+
     @app.get("/media/{song_id}")
     def stream_media(
         song_id: str,
         request: Request,
         mode: str = Query(default="original", pattern="^(original|instrumental|vocal)$"),
     ):
+        if not re.fullmatch(r"[a-f0-9]{16}", song_id):
+            raise HTTPException(status_code=400, detail="Invalid song ID")
         with db_lock:
             row = conn.execute(
                 "SELECT file_path, instrumental_path, vocal_path FROM songs WHERE id = ?",

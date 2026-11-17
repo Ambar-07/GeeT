@@ -11,7 +11,7 @@ Audio files, processed stems, full library paths, and local credentials remain s
 
 ## Project Status and Progress Overview
 
-Overall Delivery Progress: 67% (6 of 9 roadmap phases implemented in code).
+Overall Delivery Progress: 78% (7 of 9 roadmap phases implemented in code).
 
 | Phase | Milestone | Status | Test & Gate Status |
 | :--- | :--- | :--- | :--- |
@@ -21,8 +21,8 @@ Overall Delivery Progress: 67% (6 of 9 roadmap phases implemented in code).
 | Phase 4 | Room Lifecycle & Realtime (Guest Auth, Room Creation, QR Code, State Sync) | Completed (Code) | Unit & Build Verified (Live Cloud Gate Pending) |
 | Phase 5 | Queue Management & Mutational RPCs (Atomic Ordering, Idempotency, Host Controls) | Completed (Code) | Unit & Build Verified (Live Cloud Gate Pending) |
 | Phase 6 | Local Instrumental Separation (CPU/GPU Fallback, Cache Management, Preview) | Completed (Code) | Verified via Test Separator (Live Demucs/FFmpeg Pending) |
-| Phase 7 | Hardening (Security Verification, Rate Limiting, Failure Recovery) | Pending | Scheduled next |
-| Phase 8 | Production Deployment (Cloudflare Pages Build, Supabase Migrations, Runbooks) | Pending | Planned |
+| Phase 7 | Hardening (Rate Limits, Security Headers, Backups, Quota Telemetry, E2E) | Completed (Code) | Verified (Vitest, Pytest, Chrome E2E; Live RLS/Device Pending) |
+| Phase 8 | Production Deployment (Cloudflare Pages Build, Supabase Migrations, Runbooks) | Pending | Scheduled next |
 | Phase 9 | Optional Low-Latency WebRTC Microphones | Pending | Experimental gate |
 
 ---
@@ -42,58 +42,50 @@ Overall Delivery Progress: 67% (6 of 9 roadmap phases implemented in code).
 - Dynamic timeline offset engine supporting arbitrary micro-adjustments without destructive edits.
 
 #### Local Host Agent (`services/host-agent`)
-- HTTP loopback service bound strictly to `127.0.0.1:8765`.
-- Path traversal protection enforcing directory boundary allowlists for both source media and cached stems.
+- HTTP loopback service bound strictly to `127.0.0.1:8765`, with optional `HOST_AUTH_TOKEN` (`X-Host-Token`) enforcement on mutating endpoints.
+- Path traversal protection enforcing directory boundary allowlists for source media and cached stems, plus strict 16-char hex song ID validation on media routes.
 - Media streaming endpoint (`/media/{song_id}?mode=original|instrumental|vocal`) with RFC 7233 partial byte-range (`206`) support for seek operations.
 - DRM detection mechanism automatically rejecting `.m4p` and FairPlay-protected containers while keeping original files untouched.
 - Incremental library indexing leveraging file sizes, modification timestamps, and content hash fingerprints to detect duplicates without full scans.
 - SQLite job ledger tracking scanning and separation states with cancellation capabilities.
+- Atomic SQLite metadata-only backup endpoint (`POST /backup`) storing backups in `HOST_DATA_DIR/backups/` without audio files.
 - Timed lyrics management with automatic sidecar `.lrc` ingestion, durable manual updates, and metadata-validated LRCLIB querying.
 - Local instrumental separation (`separator.py`, `POST /songs/{id}/prepare`, `POST /songs/{id}/cache/clear`):
-  - Single-worker bounded background execution (`ThreadPoolExecutor(max_workers=1)`) so playback and HTTP endpoints are never blocked.
+  - Single-worker bounded background execution (`ThreadPoolExecutor(max_workers=1)`).
   - Automatic compute detection (`cuda`, `mps`, or `cpu` fallback).
-  - Pre-run free disk space verification (`>= 200 MB`), stem duration and non-empty file integrity verification, atomic cache promotion via staging files, and guaranteed temporary directory cleanup on cancellation or failure.
-  - Original files are never overwritten or modified.
+  - Pre-run free disk space verification (`>= 200 MB`), stem integrity verification, atomic cache promotion, and temp cleanup on cancellation or failure.
 
 #### Supabase Database Architecture (`supabase/migrations/`)
-- Migration `0001_initial_schema.sql`: Core tables (`rooms`, `room_participants`, `room_songs`, `queue_entries`, `playback_state`), Row Level Security (RLS) enabled on all exposed tables with explicit membership and host authorization policies using `SECURITY DEFINER` functions with fixed search paths (`SET search_path = public, pg_temp`), and base transactional RPCs.
-- Migration `0002_room_realtime_and_capability.sql`: Column-level privilege revocation preventing PostgREST select access to `rooms.host_capability_hash`, transactional `set_room_status` RPC, and automatic registration of room tables to the `supabase_realtime` publication.
-- Migration `0003_queue_and_playback_rpcs.sql`: Shared internal `_assert_host_capability` helper, hardened `add_song` with room locking and per-participant queue caps, and host-only `reorder_queue`, `advance_queue`, and `sync_playback_checkpoint` RPCs with direct client writes to `playback_state` revoked.
+- Migration `0001_initial_schema.sql`: Core tables (`rooms`, `room_participants`, `room_songs`, `queue_entries`, `playback_state`), RLS enabled on all exposed tables with `SECURITY DEFINER` helpers (`SET search_path = public, pg_temp`), and base transactional RPCs.
+- Migration `0002_room_realtime_and_capability.sql`: Column-level privilege revocation on `rooms.host_capability_hash`, `set_room_status` RPC, and `supabase_realtime` publication registration.
+- Migration `0003_queue_and_playback_rpcs.sql`: Shared `_assert_host_capability` helper, hardened `add_song`, and host-only `reorder_queue`, `advance_queue`, and `sync_playback_checkpoint` RPCs.
+- Migration `0004_hardening_and_rate_limits.sql`: `rate_limits` table and `_check_rate_limit` helper enforcing per-user rate limits on `create_room` (5/hour), `join_room` (15/5 min), and `add_song` (20/5 min).
+- Security Verification (`tests/security/rls_adversarial.sql`): Rollback-safe adversarial SQL test suite verifying `anon`, non-member `authenticated`, participant, and host boundaries.
 
-#### Room, Queue & Realtime Coordination (`apps/web/src/lib/rooms.ts`)
+#### Room, Queue, Realtime & Quota Telemetry (`apps/web/src/lib/rooms.ts`)
 - Anonymous Supabase authentication session handling (`ensureAuthSession`).
 - Host room creation with session-scoped high-entropy capability storage.
 - Participant room join by alphanumeric code and display name.
-- Batched metadata publication (`publishRoomSongs`) in 100-song chunks, strictly excluding private paths, audio payloads, and DRM files.
-- Authoritative snapshot synchronization including active `queue_entries` with revision comparison (`reconcileSnapshot`).
-- Typed RPC wrappers for queue mutations and playback checkpoints, plus pure `moveQueueEntry` reordering helper.
-- Realtime channel bindings for Postgres table changes, client presence tracking, and throttled broadcast reactions (maximum 1 event per 2 seconds).
+- Batched metadata publication (`publishRoomSongs`) in 100-song chunks, excluding private paths, audio payloads, and DRM files.
+- Authoritative snapshot synchronization with revision comparison (`reconcileSnapshot`).
+- Typed RPC wrappers for queue mutations and playback checkpoints, plus `moveQueueEntry`.
+- Realtime channel bindings, client presence tracking, throttled broadcast reactions (max 1 per 2 s), and session quota telemetry (`getQuotaTelemetry`).
 
-#### Web Interface (`apps/web`)
-- React 19 application utilizing React Router and Tailwind CSS.
-- Host Console (`HostPage`, `HostRoomPanel`):
-  - Agent health diagnostics (including FFprobe, Demucs, and compute device status) and directory allowlist management.
-  - Incremental library scan triggers and cursor-paginated song browsing with readiness badges.
-  - Local audio player with `Original` / `Instrumental` / `Vocal Preview` mode switching (preserving playback timestamp), separation job polling, `Reprocess`, `Cancel`, and `Clear Cache` actions, and automatic fallback to original audio if stems are unavailable.
-  - `requestAnimationFrame` lyric visualizer with offset controls (±100 ms, ±500 ms, ±1 s, reset).
-  - Cloud Room control panel with live QR code generation, participant counters, queue controls, and automatic playback/checkpoint coordination.
-- Participant Room Interface (`RoomPage`):
-  - Join form with session recovery on refresh, manual `Sync` reconciliation, `Now Playing`, `Up Next` queue view, self-removal, debounced catalogue search, and throttled reactions.
-- Routing and Infrastructure: Single-page application fallback routing configured for Cloudflare Pages via `_redirects`.
+#### Web Interface & Edge Security (`apps/web`)
+- React 19 application utilizing React Router and Tailwind CSS, with accessible input labels and ARIA status/alert regions.
+- Host Console (`HostPage`, `HostRoomPanel`) with local playback, mode switching, lyrics sync/calibration, SQLite backup trigger, QR join, live queue controls, and Realtime quota telemetry display.
+- Participant Room Interface (`RoomPage`) with session recovery, queue view, self-removal, and debounced search.
+- Cloudflare Pages SPA fallback routing (`_redirects`) and security/CSP headers (`_headers`).
+- Browser E2E verification (`playwright.config.ts`, `tests/e2e/smoke.spec.ts`) executing Chrome against Vite and the local host agent.
 
 ---
 
 ### 2. Pending Capabilities
 
-1. **Phase 7 - Hardening**
-   - Automated Playwright E2E tests and adversarial RLS security test suite.
-   - Quota monitoring UI, rate-limit verification, and documented backup/restore rehearsal.
+1. **Phase 8 - Production Deployment**
+   - Cloudflare Pages deployment guide, Supabase production setup/migrations, architecture Mermaid diagrams, backup/restore rehearsal evidence, troubleshooting guide, and known limitations report.
 
-2. **Phase 8 - Production Deployment**
-   - Cloudflare Pages deployment guide, Supabase production setup/migrations, and architecture Mermaid diagrams.
-   - Troubleshooting guide and known limitations report.
-
-3. **Phase 9 - Optional WebRTC Microphones**
+2. **Phase 9 - Optional WebRTC Microphones**
    - WebRTC signaling over Supabase Realtime, host Web Audio mixing, explicit mic permissions, wired-mic fallback, and measured latency gate.
 
 ---
@@ -110,8 +102,11 @@ karaoke-platform/
   services/
     host-agent/            # Python FastAPI service, SQLite, indexer, and stem separator
   supabase/
-    migrations/            # Version-controlled PostgreSQL schemas, RLS, and RPCs
+    migrations/            # Version-controlled PostgreSQL schemas, RLS, rate limits, and RPCs
     seed.sql               # Development fixtures
+  tests/
+    e2e/                   # Playwright Chrome end-to-end tests
+    security/              # Adversarial PostgreSQL RLS verification suite
   docs/
     quotas.md              # Free-tier quota guardrails and operational constraints
 ```
@@ -123,49 +118,33 @@ karaoke-platform/
 ### Prerequisites
 - Node.js >= 20.x and npm >= 10.x
 - Python >= 3.11
-- FFmpeg and FFprobe (optional for metadata reading via Mutagen fallback; required for non-WAV separation)
-- Demucs (optional; required on host for live vocal/instrumental separation)
+- Google Chrome (for Playwright E2E)
+- FFmpeg / FFprobe / Demucs (optional for local metadata via Mutagen; required for non-WAV separation)
 
-### 1. Install Node Dependencies
+### 1. Install Dependencies
 ```bash
 npm install
-```
-
-### 2. Configure Host Agent Environment
-```bash
 cd services/host-agent
 python -m venv .venv
-# Windows PowerShell
 .\.venv\Scripts\Activate.ps1
-# Unix / macOS
-source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-### 3. Verification Suite
-Execute the full automated test suite to validate all implemented modules:
-
+### 2. Verification Suite
 ```bash
-# Typecheck TypeScript packages and web application
 npm run typecheck
-
-# Run unit tests across TypeScript packages
 npm run test
-
-# Compile production web bundle
 npm run build
-
-# Run host agent integration tests
 python -m pytest services/host-agent/tests
+npx playwright test
 ```
 
-### 4. Running the Development Environment
+### 3. Running the Development Environment
 ```bash
-# Terminal 1: Host Agent (runs on http://127.0.0.1:8765)
+# Terminal 1: Host Agent (http://127.0.0.1:8765)
 cd services/host-agent
 .\.venv\Scripts\python.exe -m host_agent
 
-# Terminal 2: Web Application (runs on http://localhost:5173)
+# Terminal 2: Web Application (http://localhost:5173)
 npm run dev:web
 ```

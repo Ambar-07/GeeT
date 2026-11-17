@@ -17,8 +17,11 @@ services/host-agent/data/
 services/host-agent/cache/
 *.db
 *.sqlite3
+.e2e-tmp/
 
 # Logs & OS
 *.log
 .DS_Store
 Thumbs.db
+test-results/
+playwright-report/
