@@ -4,4 +4,15 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    host: true,
+    proxy: {
+      "/lan-api": {
+        target: "http://127.0.0.1:8765",
+        changeOrigin: true,
+        ws: true,
+        rewrite: (path) => path.replace(/^\/lan-api/, "/lan"),
+      },
+    },
+  },
 });

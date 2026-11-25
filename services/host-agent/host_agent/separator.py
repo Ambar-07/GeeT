@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -6,6 +7,22 @@ import time
 import wave
 from pathlib import Path
 from typing import Callable
+
+PROGRESS_RE = re.compile(r"(\d{1,3})%\|")
+
+
+def find_ffmpeg() -> str | None:
+    """Locate system ffmpeg or bundled imageio-ffmpeg binary."""
+    system = shutil.which("ffmpeg")
+    if system:
+        return system
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        return exe if exe and Path(exe).is_file() else None
+    except Exception:
+        return None
 
 
 def detect_compute_device() -> str:
@@ -51,17 +68,56 @@ def verify_stem_integrity(stem_path: Path, expected_duration_ms: int = 0) -> Non
             )
 
 
+def _decode_to_stereo_wav(source_path: Path, tmp_dir: Path) -> Path:
+    """Pre-decode ALAC/EC-3/M4A/FLAC/MP3 to standard 44.1kHz stereo WAV via bundled ffmpeg."""
+    if source_path.suffix.lower() == ".wav":
+        return source_path
+    ffmpeg_exe = find_ffmpeg()
+    if not ffmpeg_exe:
+        raise RuntimeError("FFmpeg is required to decode non-WAV audio for separation")
+    wav_in = tmp_dir / "input.wav"
+    proc = subprocess.run(
+        [
+            ffmpeg_exe,
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_in),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0 or not wav_in.is_file() or wav_in.stat().st_size <= 44:
+        raise RuntimeError(f"FFmpeg decode failed: {proc.stderr.strip()[-240:]}")
+    return wav_in
+
+
 def run_demucs_separation(
     source_path: Path,
     tmp_dir: Path,
     device: str,
     cancel_check: Callable[[], bool],
+    progress_cb: Callable[[int], None] | None = None,
 ) -> tuple[Path, Path]:
     """Run local Demucs two-stem vocal separation into tmp_dir and return (instrumental, vocal)."""
     if not has_demucs():
         raise RuntimeError("Demucs is not installed on this host")
-    if shutil.which("ffmpeg") is None and source_path.suffix.lower() != ".wav":
-        raise RuntimeError("FFmpeg is required to decode non-WAV audio for separation")
+
+    input_wav = _decode_to_stereo_wav(source_path, tmp_dir)
+    if cancel_check():
+        raise RuntimeError("Cancelled")
+    if progress_cb:
+        progress_cb(20)
 
     cmd = [
         sys.executable,
@@ -72,9 +128,31 @@ def run_demucs_separation(
         device,
         "-o",
         str(tmp_dir),
-        str(source_path),
+        str(input_wav),
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    import threading
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    stderr_buf: list[str] = []
+
+    def _drain_stderr() -> None:
+        if not proc.stderr:
+            return
+        buf = ""
+        while True:
+            chunk = proc.stderr.read(128)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            stderr_buf.append(text)
+            buf = (buf + text)[-256:]
+            matches = PROGRESS_RE.findall(buf)
+            if matches and progress_cb:
+                progress_cb(min(95, 20 + int(int(matches[-1]) * 0.75)))
+
+    reader = threading.Thread(target=_drain_stderr, daemon=True)
+    reader.start()
+
     while proc.poll() is None:
         if cancel_check():
             proc.terminate()
@@ -85,8 +163,10 @@ def run_demucs_separation(
             raise RuntimeError("Cancelled")
         time.sleep(0.25)
 
+    reader.join(timeout=2)
+
     if proc.returncode != 0:
-        err = (proc.stderr.read() if proc.stderr else "").strip()
+        err = "".join(stderr_buf).strip()
         raise RuntimeError(f"Demucs failed (exit {proc.returncode}): {err[-300:]}")
 
     inst_matches = list(tmp_dir.rglob("no_vocals.wav"))

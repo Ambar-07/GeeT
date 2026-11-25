@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS songs (
     album TEXT,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     format TEXT NOT NULL,
+    codec TEXT,
     size_bytes INTEGER NOT NULL DEFAULT 0,
     mtime_ns INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT,
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS songs (
     readiness TEXT NOT NULL DEFAULT 'raw',
     has_lyrics INTEGER NOT NULL DEFAULT 0,
     has_instrumental INTEGER NOT NULL DEFAULT 0,
+    has_cover INTEGER NOT NULL DEFAULT 0,
     instrumental_path TEXT,
     vocal_path TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -69,10 +71,12 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
         conn,
         "songs",
         {
+            "codec": "TEXT",
             "size_bytes": "INTEGER NOT NULL DEFAULT 0",
             "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
             "content_hash": "TEXT",
             "duplicate_of": "TEXT",
+            "has_cover": "INTEGER NOT NULL DEFAULT 0",
             "instrumental_path": "TEXT",
             "vocal_path": "TEXT",
         },

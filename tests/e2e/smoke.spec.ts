@@ -52,3 +52,58 @@ test("home join flow and host console local playback + backup", async ({ page })
   await page.getByRole("button", { name: "Backup DB" }).click();
   await expect(page.getByText(/SQLite backup saved: host_agent-/)).toBeVisible();
 });
+
+test("LAN Party Room guest queue, live sync status, reactions, and TV stage overlay", async ({
+  browser,
+}) => {
+  const musicDir = path.resolve(".e2e-tmp/music");
+  fs.mkdirSync(musicDir, { recursive: true });
+  writeMinimalWav(path.join(musicDir, "party_song.wav"));
+  fs.writeFileSync(path.join(musicDir, "party_song.lrc"), "[00:00.00]Party Stage Lyric\n", "utf8");
+
+  const hostContext = await browser.newContext();
+  const hostPage = await hostContext.newPage();
+
+  await hostPage.goto("/host");
+  await expect(hostPage.getByText(/Connected • \d+ songs/)).toBeVisible();
+
+  await hostPage.getByLabel("Local music folder path").fill(musicDir);
+  await hostPage.getByRole("button", { name: "Add & Scan" }).click();
+  await expect(hostPage.getByText("party song").first()).toBeVisible();
+
+  // Start LAN Party Room (zero-cloud fallback)
+  await hostPage.getByRole("button", { name: "Start LAN Party Room" }).click();
+  await expect(hostPage.getByText("LAN Live")).toBeVisible();
+
+  // Grab room code from join link
+  const joinAnchor = hostPage.locator('a[href^="/join/"]').first();
+  const joinHref = await joinAnchor.getAttribute("href");
+  expect(joinHref).toMatch(/^\/join\/[A-Z0-9]{8}$/);
+
+  // Switch host to TV Stage Mode and verify overlay shows QR + room code without dropping sync
+  await hostPage.getByRole("button", { name: "TV Stage Mode" }).click();
+  await expect(hostPage.getByText("Scan to Queue")).toBeVisible();
+
+  // Guest joins in a second browser context
+  const guestContext = await browser.newContext();
+  const guestPage = await guestContext.newPage();
+  await guestPage.goto(joinHref!);
+
+  await guestPage.getByLabel("Your display name").fill("Maya");
+  await guestPage.getByRole("button", { name: "Enter Room" }).click();
+  await expect(guestPage.getByText("LAN Live")).toBeVisible();
+
+  // Guest queues song and sends reaction
+  await guestPage.locator("li", { hasText: "party song" }).getByRole("button", { name: "Queue" }).click();
+  await expect(guestPage.getByText("You're Up Next!")).toBeVisible();
+
+  await guestPage.getByRole("button", { name: /Encore/ }).click();
+
+  // Host TV Stage displays floating reaction burst AND Up Next chip while in TV Stage Mode
+  const stage = hostPage.getByRole("main", { name: "Karaoke Stage" });
+  await expect(stage.getByText("· Maya")).toBeVisible();
+  await expect(stage.getByText("(Maya)")).toBeVisible();
+
+  await guestContext.close();
+  await hostContext.close();
+});

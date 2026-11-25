@@ -17,14 +17,17 @@ from typing import Callable, Iterator
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from mutagen import File as MutagenFile
+from mutagen.mp4 import MP4Cover
 from pydantic import BaseModel
 
 from .config import get_config
 from .db import connect_db
+from .lan_rooms import create_lan_router
 from .separator import (
     detect_compute_device,
+    find_ffmpeg,
     has_demucs,
     run_demucs_separation,
     verify_stem_integrity,
@@ -35,7 +38,30 @@ SeparatorFn = Callable[[Path, Path, str, Callable[[], bool]], tuple[Path, Path]]
 
 SUPPORTED_EXTS = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".flac": "audio/flac"}
 DRM_EXTS = {".m4p"}
+TRANSCODE_CODECS = {"alac", "ec-3", "ac-3"}
 LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]")
+
+
+def _extract_embedded_lyrics(file_path: Path) -> str:
+    try:
+        raw = MutagenFile(file_path)
+        if not raw or not raw.tags:
+            return ""
+        # MP4 / M4A (©lyr)
+        if "\xa9lyr" in raw.tags and raw.tags["\xa9lyr"]:
+            val = raw.tags["\xa9lyr"][0]
+            return str(val).strip()
+        # FLAC / Vorbis
+        for key in ("lyrics", "LYRICS", "unsyncedlyrics", "UNSYNCEDLYRICS"):
+            if key in raw.tags and raw.tags[key]:
+                return str(raw.tags[key][0]).strip()
+        # ID3 USLT
+        for key, frame in raw.tags.items():
+            if str(key).startswith("USLT") and getattr(frame, "text", None):
+                return str(frame.text).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _has_timed_lrc(lrc_text: str) -> bool:
@@ -96,15 +122,79 @@ def _ffprobe_metadata(file_path: Path) -> tuple[str, str, str | None, int] | Non
         return None
 
 
-def _read_metadata(file_path: Path) -> tuple[str, str, str | None, int]:
-    probed = _ffprobe_metadata(file_path)
-    if probed is not None and probed[3] > 0:
-        return probed
+def _extract_cover_bytes(file_path: Path) -> tuple[bytes, str] | None:
+    try:
+        raw = MutagenFile(file_path)
+        if raw is not None:
+            # MP4 / M4A (covr)
+            if raw.tags and "covr" in raw.tags and raw.tags["covr"]:
+                covr = raw.tags["covr"][0]
+                mime = (
+                    "image/png"
+                    if getattr(covr, "imageformat", None) == MP4Cover.FORMAT_PNG
+                    else "image/jpeg"
+                )
+                return bytes(covr), mime
+            # FLAC pictures
+            pics = getattr(raw, "pictures", None)
+            if pics:
+                pic = pics[0]
+                return bytes(pic.data), (pic.mime or "image/jpeg")
+            # ID3 / MP3 APIC frames
+            if raw.tags:
+                for key, frame in raw.tags.items():
+                    if str(key).startswith("APIC") and getattr(frame, "data", None):
+                        return bytes(frame.data), (getattr(frame, "mime", None) or "image/jpeg")
+    except Exception:
+        pass
 
+    # Fallback: folder cover image
+    parent = file_path.parent
+    for name, mime in (
+        ("cover.jpg", "image/jpeg"),
+        ("cover.jpeg", "image/jpeg"),
+        ("cover.png", "image/png"),
+        ("folder.jpg", "image/jpeg"),
+        ("folder.png", "image/png"),
+    ):
+        cand = parent / name
+        if cand.is_file():
+            try:
+                return cand.read_bytes(), mime
+            except OSError:
+                pass
+    return None
+
+
+def _read_metadata(file_path: Path) -> tuple[str, str, str | None, int, str | None, bool]:
+    probed = _ffprobe_metadata(file_path)
     title = probed[0] if probed else file_path.stem
     artist = probed[1] if probed else ""
     album = probed[2] if probed else None
     duration_ms = probed[3] if probed else 0
+    codec: str | None = None
+    has_cover = False
+
+    try:
+        raw = MutagenFile(file_path)
+        if raw is not None:
+            info = getattr(raw, "info", None)
+            if info is not None:
+                if duration_ms == 0 and getattr(info, "length", 0):
+                    duration_ms = int(info.length * 1000)
+                raw_codec = getattr(info, "codec", None)
+                if raw_codec:
+                    codec = str(raw_codec)
+            if raw.tags:
+                if "covr" in raw.tags and raw.tags["covr"]:
+                    has_cover = True
+                elif any(str(k).startswith("APIC") for k in raw.tags.keys()):
+                    has_cover = True
+            if getattr(raw, "pictures", None):
+                has_cover = True
+    except Exception:
+        pass
+
     try:
         audio = MutagenFile(file_path, easy=True)
         if audio is not None:
@@ -117,10 +207,19 @@ def _read_metadata(file_path: Path) -> tuple[str, str, str | None, int]:
                 album = album_list[0] if album_list else album
     except Exception:
         pass
-    return title, artist, album, duration_ms
+
+    if not has_cover:
+        parent = file_path.parent
+        has_cover = any(
+            (parent / name).is_file()
+            for name in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png")
+        )
+
+    return title, artist, album, duration_ms, codec, has_cover
 
 
 def _song_row_to_dict(r: sqlite3.Row) -> dict:
+    keys = set(r.keys())
     return {
         "id": r["id"],
         "title": r["title"],
@@ -128,9 +227,11 @@ def _song_row_to_dict(r: sqlite3.Row) -> dict:
         "album": r["album"],
         "duration_ms": r["duration_ms"],
         "format": r["format"],
+        "codec": r["codec"] if "codec" in keys else None,
         "readiness": r["readiness"],
         "has_lyrics": bool(r["has_lyrics"]),
         "has_instrumental": bool(r["has_instrumental"]),
+        "has_cover": bool(r["has_cover"]) if "has_cover" in keys else False,
         "duplicate_of": r["duplicate_of"],
     }
 
@@ -216,15 +317,19 @@ def create_app(
     active_data_dir = (data_dir or cfg["data_dir"]).resolve()
     active_token = cfg["auth_token"] if auth_token is None else auth_token
     stems_root = active_cache_dir / "stems"
+    playback_root = active_cache_dir / "playback"
     tmp_root = active_cache_dir / "tmp"
     backups_root = active_data_dir / "backups"
     stems_root.mkdir(parents=True, exist_ok=True)
+    playback_root.mkdir(parents=True, exist_ok=True)
     tmp_root.mkdir(parents=True, exist_ok=True)
     backups_root.mkdir(parents=True, exist_ok=True)
 
     run_separator: SeparatorFn = separator_fn or run_demucs_separation
     compute_device = detect_compute_device()
     db_lock = threading.Lock()
+    transcode_locks_guard = threading.Lock()
+    transcode_locks: dict[str, threading.Lock] = {}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="geet-sep")
 
     app = FastAPI(title="GeeT Host Agent", version="0.4.0")
@@ -232,7 +337,8 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$",
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Range", "X-Host-Token"],
         expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
     )
@@ -253,7 +359,7 @@ def create_app(
         return {
             "status": "ok",
             "sqlite": True,
-            "ffmpeg": shutil.which("ffmpeg") is not None,
+            "ffmpeg": find_ffmpeg() is not None,
             "ffprobe": shutil.which("ffprobe") is not None,
             "demucs": has_demucs(),
             "compute_device": compute_device,
@@ -315,7 +421,16 @@ def create_app(
                     skipped_unchanged += 1
                     continue
 
-                title, artist, album, duration_ms = _read_metadata(canonical)
+                title, artist, album, duration_ms, codec, has_cover = _read_metadata(canonical)
+                sidecar = canonical.with_suffix(".lrc")
+                has_sidecar_lrc = False
+                if sidecar.is_file():
+                    try:
+                        has_sidecar_lrc = _has_timed_lrc(
+                            sidecar.read_text(encoding="utf-8", errors="replace")
+                        )
+                    except OSError:
+                        has_sidecar_lrc = False
                 chash = _content_fingerprint(canonical, stat.st_size)
                 dup_row = conn.execute(
                     "SELECT id FROM songs WHERE content_hash = ? AND id <> ? ORDER BY updated_at ASC LIMIT 1",
@@ -328,19 +443,22 @@ def create_app(
                 conn.execute(
                     """
                     INSERT INTO songs (
-                        id, file_path, title, artist, album, duration_ms, format,
-                        size_bytes, mtime_ns, content_hash, duplicate_of
+                        id, file_path, title, artist, album, duration_ms, format, codec,
+                        size_bytes, mtime_ns, content_hash, duplicate_of, has_lyrics, has_cover
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
                         artist = excluded.artist,
                         album = excluded.album,
                         duration_ms = excluded.duration_ms,
+                        codec = excluded.codec,
                         size_bytes = excluded.size_bytes,
                         mtime_ns = excluded.mtime_ns,
                         content_hash = excluded.content_hash,
                         duplicate_of = excluded.duplicate_of,
+                        has_lyrics = CASE WHEN songs.has_lyrics = 1 THEN 1 ELSE excluded.has_lyrics END,
+                        has_cover = excluded.has_cover,
                         updated_at = datetime('now')
                     """,
                     (
@@ -351,10 +469,13 @@ def create_app(
                         album,
                         duration_ms,
                         ext.lstrip("."),
+                        codec,
                         stat.st_size,
                         stat.st_mtime_ns,
                         chash,
                         dup_of,
+                        int(has_sidecar_lrc),
+                        int(has_cover),
                     ),
                 )
                 scanned += 1
@@ -391,7 +512,7 @@ def create_app(
         limit: int = Query(default=50, ge=1, le=200),
     ):
         like = f"%{query.strip()}%"
-        params: list = [like, like]
+        params: list = [like, like, like]
         cursor_clause = ""
         if cursor:
             c_title, c_id = _decode_cursor(cursor)
@@ -401,9 +522,10 @@ def create_app(
         params.append(limit + 1)
         rows = conn.execute(
             f"""
-            SELECT id, title, artist, album, duration_ms, format, readiness, has_lyrics, has_instrumental, duplicate_of
+            SELECT id, title, artist, album, duration_ms, format, codec, readiness,
+                   has_lyrics, has_instrumental, has_cover, duplicate_of
             FROM songs
-            WHERE (title LIKE ? OR artist LIKE ?)
+            WHERE (title LIKE ? OR artist LIKE ? OR COALESCE(album, '') LIKE ?)
             {cursor_clause}
             ORDER BY title ASC, id ASC
             LIMIT ?
@@ -420,7 +542,8 @@ def create_app(
     def get_song(song_id: str):
         row = conn.execute(
             """
-            SELECT id, title, artist, album, duration_ms, format, readiness, has_lyrics, has_instrumental, duplicate_of
+            SELECT id, title, artist, album, duration_ms, format, codec, readiness,
+                   has_lyrics, has_instrumental, has_cover, duplicate_of
             FROM songs WHERE id = ?
             """,
             (song_id,),
@@ -486,7 +609,20 @@ def create_app(
                 )
                 conn.commit()
 
-            inst_tmp, voc_tmp = run_separator(source_path, job_tmp, compute_device, is_cancelled)
+            def _update_progress(pct: int) -> None:
+                with db_lock:
+                    conn.execute(
+                        "UPDATE jobs SET progress = ?, updated_at = datetime('now') WHERE id = ?",
+                        (max(0, min(99, pct)), job_id),
+                    )
+                    conn.commit()
+
+            if separator_fn is None:
+                inst_tmp, voc_tmp = run_demucs_separation(
+                    source_path, job_tmp, compute_device, is_cancelled, progress_cb=_update_progress
+                )
+            else:
+                inst_tmp, voc_tmp = run_separator(source_path, job_tmp, compute_device, is_cancelled)
             if is_cancelled():
                 raise RuntimeError("Cancelled")
 
@@ -671,6 +807,17 @@ def create_app(
                 "synchronized_ready": sync_ready,
             }
 
+        embedded = _extract_embedded_lyrics(Path(song["file_path"]).resolve())
+        if embedded:
+            sync_ready = _has_timed_lrc(embedded)
+            return {
+                "song_id": song_id,
+                "lrc_text": embedded,
+                "offset_ms": 0,
+                "source": "sidecar",
+                "synchronized_ready": sync_ready,
+            }
+
         return {
             "song_id": song_id,
             "lrc_text": "",
@@ -767,6 +914,88 @@ def create_app(
                 dest_conn.close()
         return {"ok": True, "filename": dest_path.name, "size_bytes": dest_path.stat().st_size}
 
+    @app.get("/media/{song_id}/cover")
+    def stream_cover(song_id: str):
+        if not re.fullmatch(r"[a-f0-9]{16}", song_id):
+            raise HTTPException(status_code=400, detail="Invalid song ID")
+        with db_lock:
+            row = conn.execute(
+                "SELECT file_path FROM songs WHERE id = ?",
+                (song_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Song not found")
+        file_path = Path(row["file_path"]).resolve()
+        if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
+            raise HTTPException(status_code=403, detail="Access denied")
+        extracted = _extract_cover_bytes(file_path)
+        if not extracted:
+            raise HTTPException(status_code=404, detail="Cover art not found")
+        data, mime = extracted
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    def _ensure_browser_audio(song_id: str, file_path: Path, codec: str | None) -> tuple[Path, str]:
+        # shortcut: transcodes ALAC/EC-3 to cached 256k stereo AAC so Chrome/Edge/Firefox/Safari all play & seek; upgrade to FLAC if lossless browser output is needed
+        if (codec or "").lower() not in TRANSCODE_CODECS:
+            mime = SUPPORTED_EXTS.get(file_path.suffix.lower())
+            if not mime:
+                raise HTTPException(status_code=415, detail="Unsupported media type")
+            return file_path, mime
+
+        ffmpeg_exe = find_ffmpeg()
+        if not ffmpeg_exe:
+            return file_path, "audio/mp4"
+
+        dest = (playback_root / f"{song_id}.m4a").resolve()
+        if playback_root not in dest.parents:
+            raise HTTPException(status_code=400, detail="Invalid cache path")
+
+        with transcode_locks_guard:
+            lock = transcode_locks.setdefault(song_id, threading.Lock())
+
+        with lock:
+            src_mtime = file_path.stat().st_mtime_ns
+            if dest.is_file() and dest.stat().st_size > 0 and dest.stat().st_mtime_ns >= src_mtime:
+                return dest, "audio/mp4"
+
+            tmp_out = playback_root / f".{song_id}.{uuid.uuid4().hex[:6]}.m4a"
+            try:
+                proc = subprocess.run(
+                    [
+                        ffmpeg_exe,
+                        "-y",
+                        "-v",
+                        "error",
+                        "-i",
+                        str(file_path),
+                        "-vn",
+                        "-ac",
+                        "2",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "256k",
+                        "-movflags",
+                        "+faststart",
+                        str(tmp_out),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                    raise RuntimeError(proc.stderr.strip() or "ffmpeg transcode failed")
+                os.replace(tmp_out, dest)
+            except Exception as exc:
+                tmp_out.unlink(missing_ok=True)
+                raise HTTPException(status_code=500, detail=f"Audio transcode failed: {exc}") from exc
+
+        return dest, "audio/mp4"
+
     @app.get("/media/{song_id}")
     def stream_media(
         song_id: str,
@@ -777,7 +1006,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid song ID")
         with db_lock:
             row = conn.execute(
-                "SELECT file_path, instrumental_path, vocal_path FROM songs WHERE id = ?",
+                "SELECT file_path, codec, instrumental_path, vocal_path FROM songs WHERE id = ?",
                 (song_id,),
             ).fetchone()
         if not row:
@@ -787,10 +1016,8 @@ def create_app(
             file_path = Path(row["file_path"]).resolve()
             if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
                 raise HTTPException(status_code=403, detail="Access denied")
-            mime = SUPPORTED_EXTS.get(file_path.suffix.lower())
-            if not mime:
-                raise HTTPException(status_code=415, detail="Unsupported media type")
-            return _stream_file_range(file_path, mime, request)
+            stream_path, mime = _ensure_browser_audio(song_id, file_path, row["codec"])
+            return _stream_file_range(stream_path, mime, request)
 
         raw_stem = row["instrumental_path"] if mode == "instrumental" else row["vocal_path"]
         if not raw_stem:
@@ -799,6 +1026,37 @@ def create_app(
         if not _is_within_approved(stem_path, [stems_root]) or not stem_path.is_file():
             raise HTTPException(status_code=404, detail=f"{mode} stem missing")
         return _stream_file_range(stem_path, "audio/wav", request)
+
+    lan_router, _lan_manager = create_lan_router(
+        require_host_token=_require_host_token,
+        host_bind=cfg["bind"],
+        host_port=cfg["port"],
+    )
+    app.include_router(lan_router)
+
+    @app.get("/lan/rooms/{room_id}/cover/{host_song_id}")
+    def get_lan_room_cover(room_id: str, host_song_id: str):
+        if not re.fullmatch(r"[a-f0-9]{16}", host_song_id):
+            raise HTTPException(status_code=400, detail="Invalid song ID")
+        state = _lan_manager.get_room(room_id)
+        if host_song_id not in state.host_song_to_room_song_id:
+            raise HTTPException(status_code=404, detail="Song not published in room")
+        with db_lock:
+            row = conn.execute("SELECT file_path FROM songs WHERE id = ?", (host_song_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Song not found")
+        file_path = Path(row["file_path"]).resolve()
+        if not _is_within_approved(file_path, _approved_paths()) or not file_path.is_file():
+            raise HTTPException(status_code=403, detail="Access denied")
+        extracted = _extract_cover_bytes(file_path)
+        if not extracted:
+            raise HTTPException(status_code=404, detail="Cover art not found")
+        data, mime = extracted
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     return app
 

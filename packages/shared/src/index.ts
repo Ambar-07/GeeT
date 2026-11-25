@@ -31,9 +31,11 @@ export const HostSongSchema = z.object({
   album: z.string().nullable().optional(),
   duration_ms: z.number().int().nonnegative(),
   format: z.string(),
+  codec: z.string().nullable().optional(),
   readiness: SongReadinessSchema,
   has_lyrics: z.boolean(),
   has_instrumental: z.boolean(),
+  has_cover: z.boolean().optional(),
   duplicate_of: z.string().nullable().optional(),
 });
 export type HostSong = z.infer<typeof HostSongSchema>;

@@ -3,6 +3,20 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { Logo } from "../components/Brand";
 import { Cover, displayTitle } from "../components/Cover";
 import {
+  SyncStatusBadge,
+  type RoomTransportMode,
+  type SyncConnectionState,
+} from "../components/SyncStatusBadge";
+import {
+  addLanSongToQueue,
+  fetchLanRoomIdByCode,
+  fetchLanRoomSnapshot,
+  getStoredLanGuestUserId,
+  joinLanRoomAsParticipant,
+  removeLanSongFromQueue,
+  subscribeToLanRoom,
+} from "../lib/lanRooms";
+import {
   addSongToQueue,
   ensureAuthSession,
   fetchRoomIdByCode,
@@ -16,23 +30,35 @@ import {
 import { isSupabaseConfigured } from "../lib/supabase";
 
 const NAME_KEY = "geet_participant_name";
+const REACTION_BUTTONS = [
+  { label: "Clap", icon: "👏" },
+  { label: "Encore", icon: "🔥" },
+  { label: "Cheer", icon: "🎉" },
+  { label: "Sing", icon: "🎤" },
+] as const;
 
 export function RoomPage() {
   const { code = "" } = useParams<{ code: string }>();
   const navigate = useNavigate();
   const normalizedCode = code.trim().toUpperCase();
 
+  const [transport, setTransport] = useState<RoomTransportMode>(
+    isSupabaseConfigured ? "cloud" : "lan"
+  );
   const [displayName, setDisplayName] = useState(() => sessionStorage.getItem(NAME_KEY) ?? "");
   const [roomId, setRoomId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [onlineIds, setOnlineIds] = useState<string[]>([]);
-  const [, setConnState] = useState<"idle" | "connecting" | "subscribed" | "disconnected">("idle");
+  const [connState, setConnState] = useState<SyncConnectionState>("idle");
+  const [recentReactions, setRecentReactions] = useState<Array<{ id: string; sender: string; label: string }>>([]);
+  const [reactionCooldown, setReactionCooldown] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
   const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
+  const [justQueuedId, setJustQueuedId] = useState<string | null>(null);
 
   const sendReactionRef = useRef<((label: string) => void) | null>(null);
 
@@ -41,19 +67,38 @@ export function RoomPage() {
     return () => clearTimeout(t);
   }, [search]);
 
+  // Attempt automatic session recovery on reload (Cloud or LAN)
   useEffect(() => {
-    if (!isSupabaseConfigured || !normalizedCode) return;
+    if (!normalizedCode) return;
     let active = true;
     (async () => {
       try {
-        const { userId: uid } = await ensureAuthSession();
-        const existingId = await fetchRoomIdByCode(normalizedCode);
-        if (active && existingId) {
-          setUserId(uid);
-          setRoomId(existingId);
+        if (isSupabaseConfigured) {
+          const { userId: uid } = await ensureAuthSession();
+          const existingId = await fetchRoomIdByCode(normalizedCode);
+          if (active && existingId) {
+            setTransport("cloud");
+            setUserId(uid);
+            setRoomId(existingId);
+            return;
+          }
         }
       } catch {
-        // Wait for explicit join form submission
+        // Fall through to LAN check
+      }
+
+      try {
+        const lanId = await fetchLanRoomIdByCode(normalizedCode);
+        if (active && lanId) {
+          setTransport("lan");
+          const storedUid = getStoredLanGuestUserId(lanId);
+          if (storedUid) {
+            setUserId(storedUid);
+            setRoomId(lanId);
+          }
+        }
+      } catch {
+        // Wait for explicit join submission
       }
     })();
     return () => {
@@ -62,24 +107,37 @@ export function RoomPage() {
   }, [normalizedCode]);
 
   useEffect(() => {
-    if (!roomId || !userId || !isSupabaseConfigured) return;
+    if (!roomId || !userId) return;
+    if (transport === "cloud" && !isSupabaseConfigured) return;
     let active = true;
 
-    const sub = subscribeToRoom(roomId, userId, displayName || "Guest", {
-      onSnapshot: (snap) => {
+    const callbacks = {
+      onSnapshot: (snap: RoomSnapshot) => {
         if (active) setSnapshot((prev) => reconcileSnapshot(prev, snap));
       },
-      onPresenceCount: (ids) => {
+      onPresenceCount: (ids: string[]) => {
         if (active) setOnlineIds(ids);
       },
-      onReaction: () => {},
-      onConnectionState: (state) => {
+      onReaction: (r: { sender: string; label: string }) => {
+        if (!active) return;
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        setRecentReactions((prev) => [{ id, ...r }, ...prev].slice(0, 4));
+      },
+      onConnectionState: (state: SyncConnectionState) => {
         if (active) setConnState(state);
       },
-    });
+    };
+
+    const sub =
+      transport === "lan"
+        ? subscribeToLanRoom(roomId, userId, displayName || "Guest", callbacks)
+        : subscribeToRoom(roomId, userId, displayName || "Guest", callbacks);
+
     sendReactionRef.current = sub.sendReaction;
 
-    fetchRoomSnapshot(roomId)
+    const initialFetch =
+      transport === "lan" ? fetchLanRoomSnapshot(roomId) : fetchRoomSnapshot(roomId);
+    initialFetch
       .then((snap) => {
         if (active) setSnapshot((prev) => reconcileSnapshot(prev, snap, true));
       })
@@ -92,7 +150,7 @@ export function RoomPage() {
       sendReactionRef.current = null;
       sub.unsubscribe();
     };
-  }, [roomId, userId, displayName]);
+  }, [roomId, userId, displayName, transport]);
 
   const filteredSongs = useMemo(() => {
     const list = snapshot?.songs ?? [];
@@ -118,10 +176,17 @@ export function RoomPage() {
     ? songMap.get(snapshot.playback.song_id) ?? null
     : null;
 
+  const myNextQueueIdx = queuedEntries.findIndex((q) => q.requested_by === userId);
+  const myNextEntry = myNextQueueIdx >= 0 ? queuedEntries[myNextQueueIdx] : null;
+  const myNextSong = myNextEntry ? songMap.get(myNextEntry.song_id) ?? null : null;
+
   async function handleManualSync() {
     if (!roomId) return;
     try {
-      const fresh = await fetchRoomSnapshot(roomId);
+      const fresh =
+        transport === "lan"
+          ? await fetchLanRoomSnapshot(roomId)
+          : await fetchRoomSnapshot(roomId);
       setSnapshot((prev) => reconcileSnapshot(prev, fresh, true));
       setError(null);
     } catch (err) {
@@ -130,11 +195,17 @@ export function RoomPage() {
   }
 
   async function handleQueueSong(songId: string) {
-    if (!roomId || queueBusyId) return;
+    if (!roomId || !userId || queueBusyId) return;
     setQueueBusyId(songId);
     setError(null);
     try {
-      await addSongToQueue(roomId, songId);
+      if (transport === "lan") {
+        await addLanSongToQueue(roomId, songId, userId);
+      } else {
+        await addSongToQueue(roomId, songId);
+      }
+      setJustQueuedId(songId);
+      setTimeout(() => setJustQueuedId((cur) => (cur === songId ? null : cur)), 1800);
       await handleManualSync();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to queue song");
@@ -144,11 +215,15 @@ export function RoomPage() {
   }
 
   async function handleRemoveOwnEntry(entryId: string) {
-    if (!roomId || queueBusyId) return;
+    if (!roomId || !userId || queueBusyId) return;
     setQueueBusyId(entryId);
     setError(null);
     try {
-      await removeSongFromQueue(roomId, entryId);
+      if (transport === "lan") {
+        await removeLanSongFromQueue(roomId, entryId, { userId });
+      } else {
+        await removeSongFromQueue(roomId, entryId);
+      }
       await handleManualSync();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to remove song");
@@ -157,17 +232,48 @@ export function RoomPage() {
     }
   }
 
+  function handleSendReaction(label: string) {
+    if (reactionCooldown) return;
+    sendReactionRef.current?.(label);
+    setReactionCooldown(true);
+    setTimeout(() => setReactionCooldown(false), 1800);
+  }
+
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault();
     if (!displayName.trim() || !normalizedCode) return;
     setJoining(true);
     setError(null);
     try {
-      const { userId: uid } = await ensureAuthSession();
-      const joinedId = await joinRoomAsParticipant(normalizedCode, displayName.trim());
+      let joinedRoomId: string | null = null;
+      let joinedUserId: string | null = null;
+      let chosenTransport: RoomTransportMode = isSupabaseConfigured ? "cloud" : "lan";
+
+      if (isSupabaseConfigured) {
+        try {
+          const { userId: uid } = await ensureAuthSession();
+          const cloudRoomId = await joinRoomAsParticipant(normalizedCode, displayName.trim());
+          joinedRoomId = cloudRoomId;
+          joinedUserId = uid;
+          chosenTransport = "cloud";
+        } catch {
+          // Try LAN Party fallback if code exists on local Wi-Fi host
+          const lanRes = await joinLanRoomAsParticipant(normalizedCode, displayName.trim());
+          joinedRoomId = lanRes.roomId;
+          joinedUserId = lanRes.userId;
+          chosenTransport = "lan";
+        }
+      } else {
+        const lanRes = await joinLanRoomAsParticipant(normalizedCode, displayName.trim());
+        joinedRoomId = lanRes.roomId;
+        joinedUserId = lanRes.userId;
+        chosenTransport = "lan";
+      }
+
       sessionStorage.setItem(NAME_KEY, displayName.trim());
-      setUserId(uid);
-      setRoomId(joinedId);
+      setTransport(chosenTransport);
+      setUserId(joinedUserId);
+      setRoomId(joinedRoomId);
       navigate(`/room/${encodeURIComponent(normalizedCode)}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to join room");
@@ -176,41 +282,17 @@ export function RoomPage() {
     }
   }
 
-  if (!isSupabaseConfigured) {
-    return (
-      <div className="stage-ambient min-h-screen text-snow">
-        <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-          <div className="surface p-7 space-y-5">
-            <Logo size={26} suffix="Room" />
-            <div>
-              <p className="eyebrow">Room Code</p>
-              <h1 className="mt-1 font-mono text-2xl font-bold tracking-wider text-snow">
-                {normalizedCode}
-              </h1>
-            </div>
-            <p role="status" className="text-xs leading-relaxed text-snow/60">
-              Cloud room sync is offline on this host. Open the Host Console to play and sing locally.
-            </p>
-            <div className="flex gap-2.5 pt-1">
-              <Link to="/host" className="btn-primary px-5 py-2 text-xs">
-                Open Host Console
-              </Link>
-              <Link to="/" className="btn-ghost px-5 py-2 text-xs">
-                Back to Home
-              </Link>
-            </div>
-          </div>
-        </main>
-      </div>
-    );
-  }
-
   if (!roomId) {
     return (
       <div className="stage-ambient min-h-screen text-snow">
         <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-          <div className="surface p-7 space-y-5">
-            <Logo size={26} suffix="Join" />
+          <div className="surface p-7 space-y-5 shadow-2xl">
+            <div className="flex items-center justify-between gap-2">
+              <Logo size={26} suffix="Join" />
+              <span className="rounded-full border border-white/12 bg-white/[0.04] px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-snow/60">
+                {isSupabaseConfigured ? "Cloud / LAN" : "LAN Wi-Fi"}
+              </span>
+            </div>
             <div>
               <p className="eyebrow">Room Code</p>
               <h1 className="mt-1 font-mono text-2xl font-bold tracking-wider text-snow">
@@ -239,9 +321,14 @@ export function RoomPage() {
                 {error}
               </p>
             )}
-            <Link to="/" className="inline-block text-xs text-snow/50 hover:text-snow">
-              Back to Home
-            </Link>
+            <div className="flex items-center justify-between pt-1 text-xs">
+              <Link to="/" className="text-snow/50 hover:text-snow">
+                Back to Home
+              </Link>
+              <Link to="/host" className="text-sky/80 hover:text-sky">
+                Host Console →
+              </Link>
+            </div>
           </div>
         </main>
       </div>
@@ -250,22 +337,31 @@ export function RoomPage() {
 
   return (
     <div className="min-h-screen bg-ink-950 text-snow">
-      <main className="mx-auto max-w-2xl space-y-5 px-5 py-7">
-        <header className="surface flex flex-wrap items-center justify-between gap-4 px-5 py-4">
+      <main className="mx-auto max-w-2xl space-y-4 px-4 py-6 sm:px-5">
+        <header className="surface flex flex-wrap items-center justify-between gap-3 px-4 py-3.5 sm:px-5">
           <div className="flex items-center gap-3">
-            <Logo size={26} />
+            <Logo size={24} />
             <div>
-              <p className="eyebrow text-sky">Room {normalizedCode}</p>
-              <h1 className="text-base font-semibold text-snow">
-                {snapshot ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)` : "Loading..."}
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="eyebrow text-sky">Room {normalizedCode}</p>
+                <SyncStatusBadge state={connState} transport={transport} />
+              </div>
+              <h1 className="mt-0.5 text-sm font-semibold text-snow sm:text-base">
+                {snapshot
+                  ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)`
+                  : "Loading..."}
               </h1>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button type="button" onClick={() => void handleManualSync()} className="btn-ghost px-3.5 py-1.5 text-xs">
+            <button
+              type="button"
+              onClick={() => void handleManualSync()}
+              className="btn-ghost px-3 py-1.5 text-[11px]"
+            >
               Sync
             </button>
-            <Link to="/" className="btn-ghost px-3.5 py-1.5 text-xs">
+            <Link to="/" className="btn-ghost px-3 py-1.5 text-[11px]">
               Leave
             </Link>
           </div>
@@ -283,22 +379,48 @@ export function RoomPage() {
           </div>
         )}
 
+        {myNextSong && (
+          <div
+            role="status"
+            className="surface border-sky/40 bg-sky/10 px-4 py-3 text-xs text-snow"
+          >
+            <span className="font-mono text-[10px] uppercase tracking-wider text-sky">
+              {myNextQueueIdx === 0
+                ? "You're Up Next!"
+                : `Your Turn: #${myNextQueueIdx + 1} in queue`}
+            </span>
+            <p className="mt-0.5 font-semibold text-snow">
+              {displayTitle(myNextSong.title)}
+              {myNextSong.artist ? ` — ${myNextSong.artist}` : ""}
+            </p>
+          </div>
+        )}
+
         {playingSong && (
-          <section className="surface stage-ambient flex items-center gap-4 p-5">
-            <Cover title={playingSong.title} size={48} className="rounded-xl" />
-            <div>
+          <section className="surface stage-ambient flex items-center gap-4 p-4 sm:p-5">
+            <Cover
+              title={playingSong.title}
+              coverSrc={
+                transport === "lan" && roomId
+                  ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
+                  : undefined
+              }
+              size={52}
+              className="rounded-xl shadow-md"
+            />
+            <div className="min-w-0">
               <p className="eyebrow text-sky">
                 Now Playing ({snapshot?.playback?.status ?? "playing"})
               </p>
-              <p className="mt-0.5 text-base font-bold text-snow">
-                {displayTitle(playingSong.title)}{" "}
-                {playingSong.artist ? `— ${playingSong.artist}` : ""}
+              <p className="mt-0.5 truncate text-base font-bold text-snow">
+                {displayTitle(playingSong.title)}
+                {playingSong.artist ? ` — ${playingSong.artist}` : ""}
               </p>
             </div>
           </section>
         )}
 
-        <section className="surface p-5 space-y-3">
+        <section className="surface p-4 sm:p-5 space-y-3">
           <h2 className="text-sm font-semibold text-snow">Up Next ({queuedEntries.length})</h2>
           {queuedEntries.length === 0 ? (
             <p className="text-xs text-snow/45">Queue is empty. Pick a song below.</p>
@@ -309,8 +431,8 @@ export function RoomPage() {
                 const requester = participantMap.get(entry.requested_by) ?? "Guest";
                 const isMine = entry.requested_by === userId;
                 return (
-                  <li key={entry.id} className="flex items-center justify-between py-2.5 text-xs">
-                    <div>
+                  <li key={entry.id} className="flex items-center justify-between gap-2 py-2.5 text-xs">
+                    <div className="min-w-0 truncate">
                       <span className="mr-2 font-mono text-snow/45">{idx + 1}.</span>
                       <span className="font-semibold text-snow">
                         {s ? displayTitle(s.title) : "Song"}
@@ -322,7 +444,7 @@ export function RoomPage() {
                         type="button"
                         disabled={queueBusyId === entry.id}
                         onClick={() => void handleRemoveOwnEntry(entry.id)}
-                        className="text-xs font-medium text-pink hover:underline disabled:opacity-40"
+                        className="shrink-0 text-xs font-medium text-pink hover:underline disabled:opacity-40"
                       >
                         Remove
                       </button>
@@ -334,23 +456,32 @@ export function RoomPage() {
           )}
         </section>
 
-        <section className="surface flex flex-wrap items-center justify-between gap-3 p-5">
-          <span className="text-xs font-medium text-snow/60">Send Reaction</span>
-          <div className="flex gap-2">
-            {["Clap", "Encore", "Cheer"].map((label) => (
-              <button
-                key={label}
-                type="button"
-                onClick={() => sendReactionRef.current?.(label)}
-                className="btn-ghost px-4 py-1.5 text-xs"
-              >
-                {label}
-              </button>
-            ))}
+        <section className="surface space-y-2.5 p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="text-xs font-medium text-snow/65">Cheer the Singer</span>
+            <div className="flex flex-wrap gap-2">
+              {REACTION_BUTTONS.map(({ label, icon }) => (
+                <button
+                  key={label}
+                  type="button"
+                  disabled={reactionCooldown}
+                  onClick={() => handleSendReaction(label)}
+                  className="btn-ghost px-3 py-1.5 text-[11px]"
+                >
+                  <span aria-hidden="true">{icon}</span>
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
           </div>
+          {recentReactions.length > 0 && (
+            <p className="truncate font-mono text-[10px] text-pink/90">
+              Live: {recentReactions.map((r) => `${r.sender} sent ${r.label}`).join(" · ")}
+            </p>
+          )}
         </section>
 
-        <section className="surface p-5 space-y-4">
+        <section className="surface p-4 sm:p-5 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-snow">
               Room Catalogue ({filteredSongs.length})
@@ -368,27 +499,54 @@ export function RoomPage() {
             <p className="text-xs text-snow/45">No songs published by the host yet.</p>
           ) : (
             <ul className="divide-y divide-white/6">
-              {filteredSongs.map((song) => (
-                <li key={song.id} className="flex items-center justify-between gap-3 py-2.5 text-sm">
-                  <div className="flex min-w-0 items-center gap-3">
-                    <Cover title={song.title} size={36} className="rounded-lg" />
-                    <div className="min-w-0">
-                      <p className="truncate font-medium text-snow">{displayTitle(song.title)}</p>
-                      {song.artist && (
-                        <p className="truncate text-xs text-snow/50">{song.artist}</p>
-                      )}
+              {filteredSongs.map((song) => {
+                const isJustQueued = justQueuedId === song.id;
+                return (
+                  <li key={song.id} className="flex items-center justify-between gap-3 py-2.5 text-sm">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <Cover
+                        title={song.title}
+                        coverSrc={
+                          transport === "lan" && roomId
+                            ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(song.host_song_id)}`
+                            : undefined
+                        }
+                        size={40}
+                        className="rounded-lg shadow-sm"
+                      />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <p className="truncate font-medium text-snow">
+                            {displayTitle(song.title)}
+                          </p>
+                          {song.readiness === "ready" && (
+                            <span className="shrink-0 rounded bg-sky/15 px-1.5 py-0.5 font-mono text-[9px] uppercase text-sky">
+                              Inst
+                            </span>
+                          )}
+                        </div>
+                        {song.artist && (
+                          <p className="truncate text-xs text-snow/50">{song.artist}</p>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
-                    onClick={() => void handleQueueSong(song.id)}
-                    className="btn-primary shrink-0 px-4 py-1 text-xs"
-                  >
-                    {queueBusyId === song.id ? "Queuing..." : "Queue"}
-                  </button>
-                </li>
-              ))}
+                    <button
+                      type="button"
+                      disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
+                      onClick={() => void handleQueueSong(song.id)}
+                      className={`${
+                        isJustQueued ? "btn-light" : "btn-primary"
+                      } shrink-0 px-3.5 py-1.5 text-[11px]`}
+                    >
+                      {queueBusyId === song.id
+                        ? "Queuing..."
+                        : isJustQueued
+                          ? "Queued ✓"
+                          : "Queue"}
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>

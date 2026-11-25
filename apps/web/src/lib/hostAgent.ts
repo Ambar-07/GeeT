@@ -19,6 +19,10 @@ export function mediaUrl(songId: string, mode: AudioMode = "original"): string {
   return mode === "original" ? base : `${base}?mode=${encodeURIComponent(mode)}`;
 }
 
+export function coverUrl(songId: string): string {
+  return `${BASE_URL}/media/${encodeURIComponent(songId)}/cover`;
+}
+
 export async function fetchHostHealth(): Promise<HostHealth> {
   const res = await fetch(`${BASE_URL}/health`);
   if (!res.ok) throw new Error(`Host agent health failed: ${res.status}`);
