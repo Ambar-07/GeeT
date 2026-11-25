@@ -40,17 +40,21 @@ test("home join flow and host console local playback + backup", async ({ page })
   await page.goto("/host");
   await expect(page.getByText(/Connected • \d+ songs/)).toBeVisible();
 
+  await page.getByRole("button", { name: "Library & settings" }).click();
   await page.getByLabel("Local music folder path").fill(musicDir);
   await page.getByRole("button", { name: "Add & Scan" }).click();
-  await expect(page.getByText("e2e_track").first()).toBeVisible();
-
-  await page.locator("li", { hasText: "e2e_track" }).getByRole("button", { name: "Play" }).click();
-  const audio = page.locator("audio");
-  await expect(audio).toHaveAttribute("src", /http:\/\/127\.0\.0\.1:8765\/media\/[a-f0-9]{16}/);
-  await expect(page.getByText("E2E Sync Line")).toBeVisible();
-
+  await expect(page.getByText(/Imported \d+ tracks\./)).toBeVisible();
   await page.getByRole("button", { name: "Backup DB" }).click();
   await expect(page.getByText(/SQLite backup saved: host_agent-/)).toBeVisible();
+  await page.getByRole("button", { name: "Close settings" }).click();
+
+  await page.getByLabel("Search indexed songs").fill("e2e_track");
+  await expect(page.getByText("e2e track").first()).toBeVisible();
+
+  await page.locator("li", { hasText: "e2e track" }).getByRole("button", { name: "Play" }).click();
+  const audio = page.locator("audio").first();
+  await expect(audio).toHaveAttribute("src", /http:\/\/127\.0\.0\.1:8765\/media\/[a-f0-9]{16}/);
+  await expect(page.getByText("E2E Sync Line")).toBeVisible();
 });
 
 test("LAN Party Room guest queue, live sync status, reactions, and TV stage overlay", async ({
@@ -67,11 +71,17 @@ test("LAN Party Room guest queue, live sync status, reactions, and TV stage over
   await hostPage.goto("/host");
   await expect(hostPage.getByText(/Connected • \d+ songs/)).toBeVisible();
 
+  await hostPage.getByRole("button", { name: "Library & settings" }).click();
   await hostPage.getByLabel("Local music folder path").fill(musicDir);
   await hostPage.getByRole("button", { name: "Add & Scan" }).click();
+  await expect(hostPage.getByText(/Imported \d+ tracks\./)).toBeVisible();
+  await hostPage.getByRole("button", { name: "Close settings" }).click();
+
+  await hostPage.getByLabel("Search indexed songs").fill("party_song");
   await expect(hostPage.getByText("party song").first()).toBeVisible();
 
-  // Start LAN Party Room (zero-cloud fallback)
+  // Switch to Party tab and start LAN Party Room (zero-cloud fallback)
+  await hostPage.getByRole("tab", { name: /Party/ }).click();
   await hostPage.getByRole("button", { name: "Start LAN Party Room" }).click();
   await expect(hostPage.getByText("LAN Live")).toBeVisible();
 
@@ -93,7 +103,8 @@ test("LAN Party Room guest queue, live sync status, reactions, and TV stage over
   await guestPage.getByRole("button", { name: "Enter Room" }).click();
   await expect(guestPage.getByText("LAN Live")).toBeVisible();
 
-  // Guest queues song and sends reaction
+  // Guest searches, queues song, and sends reaction
+  await guestPage.getByLabel("Search room songs").fill("party_song");
   await guestPage.locator("li", { hasText: "party song" }).getByRole("button", { name: "Queue" }).click();
   await expect(guestPage.getByText("You're Up Next!")).toBeVisible();
 
@@ -103,6 +114,11 @@ test("LAN Party Room guest queue, live sync status, reactions, and TV stage over
   const stage = hostPage.getByRole("main", { name: "Karaoke Stage" });
   await expect(stage.getByText("· Maya")).toBeVisible();
   await expect(stage.getByText("(Maya)")).toBeVisible();
+
+  // Host starts Maya's queued track -> guest phone gets "You're On Stage" + live follow-along lyrics
+  await hostPage.getByRole("button", { name: /Play Up Next/ }).click();
+  await expect(guestPage.getByText("You're On Stage Now!")).toBeVisible();
+  await expect(guestPage.getByText("Party Stage Lyric")).toBeVisible();
 
   await guestContext.close();
   await hostContext.close();

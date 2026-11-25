@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Logo } from "../components/Brand";
 import { Cover, displayTitle } from "../components/Cover";
+import { GuestLyricsCard } from "../components/GuestLyricsCard";
 import {
   SyncStatusBadge,
   type RoomTransportMode,
@@ -10,6 +11,7 @@ import {
 import {
   addLanSongToQueue,
   fetchLanRoomIdByCode,
+  fetchLanRoomLyrics,
   fetchLanRoomSnapshot,
   getStoredLanGuestUserId,
   joinLanRoomAsParticipant,
@@ -25,6 +27,7 @@ import {
   reconcileSnapshot,
   removeSongFromQueue,
   subscribeToRoom,
+  type LiveLyricsSyncPayload,
   type RoomSnapshot,
 } from "../lib/rooms";
 import { isSupabaseConfigured } from "../lib/supabase";
@@ -59,8 +62,22 @@ export function RoomPage() {
   const [joining, setJoining] = useState(false);
   const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
   const [justQueuedId, setJustQueuedId] = useState<string | null>(null);
+  const [guestLyrics, setGuestLyrics] = useState<{
+    hostSongId: string;
+    lrcText: string;
+    offsetMs: number;
+  } | null>(null);
+  const [lyricsLoading, setLyricsLoading] = useState(false);
+  const [lyricsFullscreen, setLyricsFullscreen] = useState(false);
+  const [playbackClock, setPlaybackClock] = useState<{
+    status: "idle" | "playing" | "paused" | "ended";
+    positionMs: number;
+    localMs: number;
+  }>({ status: "idle", positionMs: 0, localMs: performance.now() });
 
   const sendReactionRef = useRef<((label: string) => void) | null>(null);
+  const requestLyricsSyncRef = useRef<(() => void) | null>(null);
+  const prevTurnStateRef = useRef<"none" | "up_next" | "on_stage">("none");
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim().toLowerCase()), 250);
@@ -126,6 +143,22 @@ export function RoomPage() {
       onConnectionState: (state: SyncConnectionState) => {
         if (active) setConnState(state);
       },
+      onLyricsSync: (payload: LiveLyricsSyncPayload) => {
+        if (!active) return;
+        setGuestLyrics({
+          hostSongId: payload.hostSongId,
+          lrcText: payload.lrcText,
+          offsetMs: payload.offsetMs,
+        });
+        setLyricsLoading(false);
+        if (payload.status !== undefined && payload.positionMs !== undefined) {
+          setPlaybackClock({
+            status: payload.status,
+            positionMs: payload.positionMs,
+            localMs: performance.now(),
+          });
+        }
+      },
     };
 
     const sub =
@@ -134,6 +167,7 @@ export function RoomPage() {
         : subscribeToRoom(roomId, userId, displayName || "Guest", callbacks);
 
     sendReactionRef.current = sub.sendReaction;
+    requestLyricsSyncRef.current = sub.requestLyricsSync;
 
     const initialFetch =
       transport === "lan" ? fetchLanRoomSnapshot(roomId) : fetchRoomSnapshot(roomId);
@@ -148,6 +182,7 @@ export function RoomPage() {
     return () => {
       active = false;
       sendReactionRef.current = null;
+      requestLyricsSyncRef.current = null;
       sub.unsubscribe();
     };
   }, [roomId, userId, displayName, transport]);
@@ -172,13 +207,100 @@ export function RoomPage() {
   );
 
   const queuedEntries = (snapshot?.queue ?? []).filter((q) => q.status === "queued");
+  const playingEntry = (snapshot?.queue ?? []).find((q) => q.status === "playing") ?? null;
   const playingSong = snapshot?.playback?.song_id
     ? songMap.get(snapshot.playback.song_id) ?? null
-    : null;
+    : playingEntry
+      ? songMap.get(playingEntry.song_id) ?? null
+      : null;
 
+  const isMyTurnNow = Boolean(playingEntry && playingEntry.requested_by === userId);
   const myNextQueueIdx = queuedEntries.findIndex((q) => q.requested_by === userId);
   const myNextEntry = myNextQueueIdx >= 0 ? queuedEntries[myNextQueueIdx] : null;
   const myNextSong = myNextEntry ? songMap.get(myNextEntry.song_id) ?? null : null;
+
+  // Keep local interpolated clock aligned with room snapshot playback updates
+  useEffect(() => {
+    const pb = snapshot?.playback;
+    if (!pb) return;
+    let driftMs = 0;
+    if (pb.status === "playing" && pb.updated_at) {
+      const updatedTs = Date.parse(pb.updated_at);
+      if (Number.isFinite(updatedTs)) {
+        driftMs = Math.min(12_000, Math.max(0, Date.now() - updatedTs));
+      }
+    }
+    setPlaybackClock({
+      status: pb.status,
+      positionMs: pb.position_ms + driftMs,
+      localMs: performance.now(),
+    });
+  }, [
+    snapshot?.playback?.status,
+    snapshot?.playback?.position_ms,
+    snapshot?.playback?.updated_at,
+    snapshot?.playback?.revision,
+  ]);
+
+  // Load active song's lyrics over LAN HTTP or request broadcast in Cloud mode
+  useEffect(() => {
+    const hostSongId = playingSong?.host_song_id;
+    if (!roomId || !hostSongId) {
+      setGuestLyrics(null);
+      setLyricsLoading(false);
+      return;
+    }
+
+    if (transport === "lan") {
+      let active = true;
+      setLyricsLoading(true);
+      fetchLanRoomLyrics(roomId, hostSongId)
+        .then((rec) => {
+          if (!active) return;
+          setGuestLyrics({
+            hostSongId,
+            lrcText: rec.lrc_text,
+            offsetMs: rec.offset_ms,
+          });
+        })
+        .catch(() => {
+          if (active) setGuestLyrics(null);
+        })
+        .finally(() => {
+          if (active) setLyricsLoading(false);
+        });
+      return () => {
+        active = false;
+      };
+    }
+
+    // Cloud mode: ask host to broadcast active lyrics on join / track change
+    if (connState === "subscribed" && guestLyrics?.hostSongId !== hostSongId) {
+      setLyricsLoading(true);
+      requestLyricsSyncRef.current?.();
+      const t = setTimeout(() => setLyricsLoading(false), 2500);
+      return () => clearTimeout(t);
+    }
+  }, [roomId, playingSong?.host_song_id, transport, connState]);
+
+  // Subtle mobile haptic buzz when transitioning into "You're Up Next!" or "You're On Stage!"
+  useEffect(() => {
+    const nextState: "none" | "up_next" | "on_stage" = isMyTurnNow
+      ? "on_stage"
+      : myNextQueueIdx === 0
+        ? "up_next"
+        : "none";
+    if (nextState !== "none" && nextState !== prevTurnStateRef.current) {
+      try {
+        if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+          navigator.vibrate(nextState === "on_stage" ? [160, 70, 160] : [110, 60, 110]);
+        }
+      } catch {
+        // Ignore on unsupported browsers
+      }
+    }
+    prevTurnStateRef.current = nextState;
+  }, [isMyTurnNow, myNextQueueIdx]);
 
   async function handleManualSync() {
     if (!roomId) return;
@@ -338,33 +460,31 @@ export function RoomPage() {
   return (
     <div className="min-h-screen bg-ink-950 text-snow">
       <main className="mx-auto max-w-2xl space-y-4 px-4 py-6 sm:px-5">
-        <header className="surface flex flex-wrap items-center justify-between gap-3 px-4 py-3.5 sm:px-5">
-          <div className="flex items-center gap-3">
-            <Logo size={24} />
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <p className="eyebrow text-sky">Room {normalizedCode}</p>
-                <SyncStatusBadge state={connState} transport={transport} />
+        <header className="surface flex items-center justify-between gap-2 px-4 py-3 sm:px-5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Logo size={22} />
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <p className="font-mono text-xs font-semibold tracking-wider text-white/90">
+                  {normalizedCode}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void handleManualSync()}
+                  title="Tap to refresh room state"
+                  className="shrink-0"
+                >
+                  <SyncStatusBadge state={connState} transport={transport} />
+                </button>
               </div>
-              <h1 className="mt-0.5 text-sm font-semibold text-snow sm:text-base">
-                {snapshot
-                  ? `${snapshot.participants.length} Joined (${onlineIds.length} Online)`
-                  : "Loading..."}
+              <h1 className="truncate text-[11px] font-medium text-white/50">
+                {snapshot ? `${onlineIds.length} online` : "Loading..."}
               </h1>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => void handleManualSync()}
-              className="btn-ghost px-3 py-1.5 text-[11px]"
-            >
-              Sync
-            </button>
-            <Link to="/" className="btn-ghost px-3 py-1.5 text-[11px]">
-              Leave
-            </Link>
-          </div>
+          <Link to="/" className="btn-ghost shrink-0 px-3.5 py-1.5 text-xs">
+            Leave
+          </Link>
         </header>
 
         {snapshot?.room.status === "host_disconnected" && (
@@ -379,16 +499,56 @@ export function RoomPage() {
           </div>
         )}
 
+        {isMyTurnNow && playingSong && (
+          <div
+            role="status"
+            className="surface flex flex-wrap items-center justify-between gap-3 border-pink/55 bg-pink/15 px-4 py-3 text-xs text-snow shadow-[0_0_24px_rgba(241,105,137,0.18)]"
+          >
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="h-2 w-2 animate-ping rounded-full bg-pink" />
+                <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-pink">
+                  You&apos;re On Stage Now! 🎤
+                </span>
+              </div>
+              <p className="mt-0.5 truncate font-semibold text-snow">
+                {displayTitle(playingSong.title)}
+                {playingSong.artist ? ` — ${playingSong.artist}` : ""}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setLyricsFullscreen(true)}
+              className="btn-primary shrink-0 px-3.5 py-1.5 text-[11px]"
+            >
+              Sing-Along Lyrics
+            </button>
+          </div>
+        )}
+
         {myNextSong && (
           <div
             role="status"
-            className="surface border-sky/40 bg-sky/10 px-4 py-3 text-xs text-snow"
+            className={`surface px-4 py-3 text-xs text-snow ${myNextQueueIdx === 0
+              ? "border-sky/60 bg-sky/15 shadow-[0_0_22px_rgba(5,147,198,0.18)]"
+              : "border-sky/35 bg-sky/10"
+              }`}
           >
-            <span className="font-mono text-[10px] uppercase tracking-wider text-sky">
-              {myNextQueueIdx === 0
-                ? "You're Up Next!"
-                : `Your Turn: #${myNextQueueIdx + 1} in queue`}
-            </span>
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-wider text-sky">
+                {myNextQueueIdx === 0 && (
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-sky" />
+                )}
+                {myNextQueueIdx === 0
+                  ? "You're Up Next!"
+                  : `Your Turn: #${myNextQueueIdx + 1} in queue`}
+              </span>
+              {myNextQueueIdx === 0 && (
+                <span className="rounded-full bg-sky/20 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-sky">
+                  Get Ready
+                </span>
+              )}
+            </div>
             <p className="mt-0.5 font-semibold text-snow">
               {displayTitle(myNextSong.title)}
               {myNextSong.artist ? ` — ${myNextSong.artist}` : ""}
@@ -397,34 +557,62 @@ export function RoomPage() {
         )}
 
         {playingSong && (
-          <section className="surface stage-ambient flex items-center gap-4 p-4 sm:p-5">
-            <Cover
-              title={playingSong.title}
+          <section className="surface stage-ambient p-4 sm:p-5">
+            <div className="flex items-center gap-4">
+              <Cover
+                title={playingSong.title}
+                coverSrc={
+                  transport === "lan" && roomId
+                    ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
+                    : undefined
+                }
+                size={52}
+                className="rounded-xl shadow-md"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-semibold text-white/55">
+                  {snapshot?.playback?.status === "paused" ? "Paused" : "Now Playing"}
+                  {playingEntry
+                    ? ` · ${participantMap.get(playingEntry.requested_by) ?? "Guest"}`
+                    : ""}
+                </p>
+                <p className="mt-0.5 truncate text-base font-bold text-white">
+                  {displayTitle(playingSong.title)}
+                  {playingSong.artist ? ` — ${playingSong.artist}` : ""}
+                </p>
+              </div>
+            </div>
+
+            <GuestLyricsCard
+              songTitle={playingSong.title}
+              songArtist={playingSong.artist}
+              durationMs={playingSong.duration_ms}
               coverSrc={
                 transport === "lan" && roomId
                   ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
                   : undefined
               }
-              size={52}
-              className="rounded-xl shadow-md"
+              lrcText={
+                guestLyrics?.hostSongId === playingSong.host_song_id ? guestLyrics.lrcText : ""
+              }
+              offsetMs={
+                guestLyrics?.hostSongId === playingSong.host_song_id ? guestLyrics.offsetMs : 0
+              }
+              playbackStatus={playbackClock.status}
+              anchorPositionMs={playbackClock.positionMs}
+              anchorLocalMs={playbackClock.localMs}
+              loading={lyricsLoading}
+              fullscreen={lyricsFullscreen}
+              onToggleFullscreen={() => setLyricsFullscreen((v) => !v)}
+              onSendReaction={handleSendReaction}
+              reactionCooldown={reactionCooldown}
             />
-            <div className="min-w-0">
-              <p className="eyebrow text-sky">
-                Now Playing ({snapshot?.playback?.status ?? "playing"})
-              </p>
-              <p className="mt-0.5 truncate text-base font-bold text-snow">
-                {displayTitle(playingSong.title)}
-                {playingSong.artist ? ` — ${playingSong.artist}` : ""}
-              </p>
-            </div>
           </section>
         )}
 
-        <section className="surface p-4 sm:p-5 space-y-3">
-          <h2 className="text-sm font-semibold text-snow">Up Next ({queuedEntries.length})</h2>
-          {queuedEntries.length === 0 ? (
-            <p className="text-xs text-snow/45">Queue is empty. Pick a song below.</p>
-          ) : (
+        {queuedEntries.length > 0 && (
+          <section className="surface p-4 sm:p-5 space-y-3">
+            <h2 className="text-sm font-semibold text-white">Up Next ({queuedEntries.length})</h2>
             <ul className="divide-y divide-white/6">
               {queuedEntries.map((entry, idx) => {
                 const s = songMap.get(entry.song_id);
@@ -433,11 +621,11 @@ export function RoomPage() {
                 return (
                   <li key={entry.id} className="flex items-center justify-between gap-2 py-2.5 text-xs">
                     <div className="min-w-0 truncate">
-                      <span className="mr-2 font-mono text-snow/45">{idx + 1}.</span>
-                      <span className="font-semibold text-snow">
+                      <span className="mr-2 font-mono text-white/40">{idx + 1}.</span>
+                      <span className="font-semibold text-white">
                         {s ? displayTitle(s.title) : "Song"}
                       </span>
-                      <span className="ml-2 text-snow/50">({requester})</span>
+                      <span className="ml-2 text-white/50">({requester})</span>
                     </div>
                     {isMine && (
                       <button
@@ -453,32 +641,32 @@ export function RoomPage() {
                 );
               })}
             </ul>
-          )}
-        </section>
+          </section>
+        )}
 
         <section className="surface space-y-2.5 p-4 sm:p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="text-xs font-medium text-snow/65">Cheer the Singer</span>
-            <div className="flex flex-wrap gap-2">
-              {REACTION_BUTTONS.map(({ label, icon }) => (
-                <button
-                  key={label}
-                  type="button"
-                  disabled={reactionCooldown}
-                  onClick={() => handleSendReaction(label)}
-                  className="btn-ghost px-3 py-1.5 text-[11px]"
-                >
-                  <span aria-hidden="true">{icon}</span>
-                  <span>{label}</span>
-                </button>
-              ))}
-            </div>
+          <div className="flex items-center justify-between">
+            <span className="eyebrow">Cheer the Singer</span>
+            {recentReactions.length > 0 && (
+              <span className="truncate font-mono text-[10px] text-pink/90">
+                {recentReactions[0].sender}: {recentReactions[0].label}
+              </span>
+            )}
           </div>
-          {recentReactions.length > 0 && (
-            <p className="truncate font-mono text-[10px] text-pink/90">
-              Live: {recentReactions.map((r) => `${r.sender} sent ${r.label}`).join(" · ")}
-            </p>
-          )}
+          <div className="grid grid-cols-4 gap-2">
+            {REACTION_BUTTONS.map(({ label, icon }) => (
+              <button
+                key={label}
+                type="button"
+                disabled={reactionCooldown}
+                onClick={() => handleSendReaction(label)}
+                className="btn-ghost py-2 text-xs"
+              >
+                <span aria-hidden="true">{icon}</span>
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
         </section>
 
         <section className="surface p-4 sm:p-5 space-y-4">
@@ -515,18 +703,11 @@ export function RoomPage() {
                         className="rounded-lg shadow-sm"
                       />
                       <div className="min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <p className="truncate font-medium text-snow">
-                            {displayTitle(song.title)}
-                          </p>
-                          {song.readiness === "ready" && (
-                            <span className="shrink-0 rounded bg-sky/15 px-1.5 py-0.5 font-mono text-[9px] uppercase text-sky">
-                              Inst
-                            </span>
-                          )}
-                        </div>
+                        <p className="truncate font-medium text-white">
+                          {displayTitle(song.title)}
+                        </p>
                         {song.artist && (
-                          <p className="truncate text-xs text-snow/50">{song.artist}</p>
+                          <p className="truncate text-xs text-white/45">{song.artist}</p>
                         )}
                       </div>
                     </div>
@@ -534,12 +715,11 @@ export function RoomPage() {
                       type="button"
                       disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
                       onClick={() => void handleQueueSong(song.id)}
-                      className={`${
-                        isJustQueued ? "btn-light" : "btn-primary"
-                      } shrink-0 px-3.5 py-1.5 text-[11px]`}
+                      className={`${isJustQueued ? "btn-light" : "btn-ghost hover:border-white/35"
+                        } shrink-0 px-3.5 py-1.5 text-xs font-semibold`}
                     >
                       {queueBusyId === song.id
-                        ? "Queuing..."
+                        ? "Adding..."
                         : isJustQueued
                           ? "Queued ✓"
                           : "Queue"}

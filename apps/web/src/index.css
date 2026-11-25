@@ -1,13 +1,13 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink-950: #050505;
-  --color-ink-900: #0b0b0d;
-  --color-ink-850: #111115;
-  --color-ink-800: #16161c;
-  --color-sky: #0593c6;
-  --color-pink: #d83996;
-  --color-snow: #fcffff;
+  --color-ink-950: #050507;
+  --color-ink-900: #0c0c10;
+  --color-ink-850: #131319;
+  --color-ink-800: #1a1a22;
+  --color-sky: #38bdf8;
+  --color-pink: #fb1e53;
+  --color-snow: #ffffff;
   --font-sans: "Inter", "Noto Sans Devanagari", "Nirmala UI", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -21,29 +21,29 @@ body {
 
 @layer components {
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-2 rounded-sm bg-pink font-mono text-xs font-semibold uppercase tracking-[0.12em] text-snow transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-full bg-gradient-to-b from-[#fa2d48] to-[#d92662] font-sans text-xs font-semibold tracking-normal text-white shadow-[0_6px_20px_rgba(250,45,72,0.26)] transition hover:brightness-110 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40;
   }
   .btn-light {
-    @apply inline-flex items-center justify-center gap-2 rounded-sm bg-snow font-mono text-xs font-semibold uppercase tracking-[0.12em] text-ink-950 transition hover:bg-snow/90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-full bg-white/95 font-sans text-xs font-semibold tracking-normal text-ink-950 shadow-sm transition hover:bg-white active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40;
   }
   .btn-ghost {
-    @apply inline-flex items-center justify-center gap-2 rounded-sm border border-white/16 bg-transparent font-mono text-xs font-medium uppercase tracking-[0.12em] text-snow/85 transition hover:border-white/40 hover:bg-white/[0.04] hover:text-snow active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-full border border-white/12 bg-white/[0.06] font-sans text-xs font-medium tracking-normal text-snow/85 transition hover:border-white/25 hover:bg-white/[0.12] hover:text-white active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40;
   }
   .field {
-    @apply w-full rounded-sm border border-white/16 bg-ink-900 px-3.5 py-2.5 text-sm text-snow outline-none transition placeholder:text-snow/35 focus:border-sky focus:bg-ink-850;
+    @apply w-full rounded-xl border border-white/12 bg-white/[0.05] px-3.5 py-2 text-sm text-snow outline-none transition placeholder:text-snow/38 focus:border-white/35 focus:bg-white/[0.08];
   }
   .surface {
-    @apply rounded-lg border border-white/12 bg-ink-900/95;
+    @apply rounded-2xl border border-white/[0.09] bg-white/[0.035] backdrop-blur-xl;
   }
   .eyebrow {
-    @apply font-mono text-[11px] font-medium uppercase tracking-[0.16em] text-snow/50;
+    @apply text-[11px] font-semibold uppercase tracking-[0.12em] text-snow/48;
   }
 }
 
 .stage-ambient {
   background:
-    radial-gradient(50% 55% at 50% 42%, rgba(5, 147, 198, 0.08), transparent 72%),
-    radial-gradient(45% 50% at 55% 48%, rgba(216, 57, 150, 0.07), transparent 72%),
+    radial-gradient(52% 52% at 22% 28%, rgba(251, 30, 83, 0.11), transparent 72%),
+    radial-gradient(48% 52% at 78% 72%, rgba(99, 102, 241, 0.08), transparent 74%),
     var(--color-ink-950);
 }
 
@@ -146,4 +146,146 @@ body {
 
 .animate-toast-up {
   animation: toastSlideUp 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Smooth GPU-composited liquid aura motion (transform-only, zero blur repaints) */
+@keyframes auraDriftA {
+  0% {
+    transform: translate3d(-8%, -6%, 0) scale(1) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(14%, 8%, 0) scale(1.14) rotate(12deg);
+  }
+  66% {
+    transform: translate3d(4%, 16%, 0) scale(0.94) rotate(-8deg);
+  }
+  100% {
+    transform: translate3d(-8%, -6%, 0) scale(1) rotate(0deg);
+  }
+}
+
+@keyframes auraDriftB {
+  0% {
+    transform: translate3d(10%, 10%, 0) scale(1.06) rotate(0deg);
+  }
+  40% {
+    transform: translate3d(-14%, -4%, 0) scale(0.95) rotate(-14deg);
+  }
+  75% {
+    transform: translate3d(-4%, 14%, 0) scale(1.15) rotate(10deg);
+  }
+  100% {
+    transform: translate3d(10%, 10%, 0) scale(1.06) rotate(0deg);
+  }
+}
+
+@keyframes auraDriftC {
+  0% {
+    transform: translate3d(6%, -10%, 0) scale(0.96);
+  }
+  50% {
+    transform: translate3d(-12%, 12%, 0) scale(1.18);
+  }
+  100% {
+    transform: translate3d(6%, -10%, 0) scale(0.96);
+  }
+}
+
+@keyframes auraDriftD {
+  0% {
+    transform: translate3d(-10%, 12%, 0) scale(1.05);
+  }
+  50% {
+    transform: translate3d(12%, -10%, 0) scale(0.92);
+  }
+  100% {
+    transform: translate3d(-10%, 12%, 0) scale(1.05);
+  }
+}
+
+/* Smooth GPU-composited flowing album-art texture motion (transform-only, zero runtime blur) */
+@keyframes auraCoverBase {
+  0% {
+    transform: translate3d(-4%, -3%, 0) scale(1.38) rotate(0deg);
+  }
+  50% {
+    transform: translate3d(4%, 3%, 0) scale(1.48) rotate(10deg);
+  }
+  100% {
+    transform: translate3d(-4%, -3%, 0) scale(1.38) rotate(0deg);
+  }
+}
+
+@keyframes auraCoverFlowA {
+  0% {
+    transform: translate3d(-10%, -8%, 0) scale(1.68) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(10%, 6%, 0) scale(1.82) rotate(55deg);
+  }
+  66% {
+    transform: translate3d(-4%, 12%, 0) scale(1.62) rotate(125deg);
+  }
+  100% {
+    transform: translate3d(-10%, -8%, 0) scale(1.68) rotate(180deg);
+  }
+}
+
+@keyframes auraCoverFlowB {
+  0% {
+    transform: translate3d(10%, 8%, 0) scale(1.75) rotate(180deg);
+  }
+  40% {
+    transform: translate3d(-12%, -4%, 0) scale(1.62) rotate(105deg);
+  }
+  75% {
+    transform: translate3d(6%, -10%, 0) scale(1.86) rotate(40deg);
+  }
+  100% {
+    transform: translate3d(10%, 8%, 0) scale(1.75) rotate(0deg);
+  }
+}
+
+.aura-cover-base {
+  animation: auraCoverBase 26s ease-in-out infinite;
+}
+
+.aura-cover-flow-a {
+  animation: auraCoverFlowA 30s ease-in-out infinite alternate;
+}
+
+.aura-cover-flow-b {
+  animation: auraCoverFlowB 36s ease-in-out infinite alternate;
+}
+
+.aura-blob {
+  position: absolute;
+  will-change: transform;
+  pointer-events: none;
+}
+
+.aura-blob-a {
+  animation: auraDriftA 22s ease-in-out infinite;
+}
+
+.aura-blob-b {
+  animation: auraDriftB 28s ease-in-out infinite;
+}
+
+.aura-blob-c {
+  animation: auraDriftC 33s ease-in-out infinite;
+}
+
+.aura-blob-d {
+  animation: auraDriftD 19s ease-in-out infinite;
+}
+
+.aura-paused .aura-blob {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aura-blob {
+    animation: none !important;
+  }
 }

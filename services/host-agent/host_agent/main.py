@@ -42,6 +42,47 @@ TRANSCODE_CODECS = {"alac", "ec-3", "ac-3"}
 LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]")
 
 
+def _clean_lrclib_title(title: str) -> str:
+    cleaned = re.sub(r"^\s*\d{1,3}\s*[.\-_]\s*", "", title).strip()
+    cleaned = re.sub(
+        r"\s*[\(\[](?:from\s+[\"'].*?[\"']|original\s+motion\s+picture.*?|soundtrack.*?|official.*?|lyric.*?|feat\.?.*?|ft\.?.*?)[\)\]]",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned or title.strip()
+
+
+def _primary_lrclib_artist(artist: str) -> str:
+    parts = re.split(r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|/|;)\s*", artist, maxsplit=1, flags=re.IGNORECASE)
+    return (parts[0] if parts else artist).strip()
+
+
+def _pick_best_lrclib_candidate(
+    candidates: list[dict], target_dur_s: float, max_dur_delta_s: float = 8.0
+) -> dict | None:
+    best: dict | None = None
+    best_score = -1.0
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        synced = (item.get("syncedLyrics") or "").strip()
+        if not synced:
+            continue
+        remote_dur = float(item.get("duration") or 0)
+        if target_dur_s > 0 and remote_dur > 0:
+            delta = abs(remote_dur - target_dur_s)
+            if delta > max_dur_delta_s:
+                continue
+            score = 100.0 - delta * 10.0
+        else:
+            score = 50.0
+        if score > best_score:
+            best_score = score
+            best = item
+    return best
+
+
 def _extract_embedded_lyrics(file_path: Path) -> str:
     try:
         raw = MutagenFile(file_path)
@@ -865,39 +906,68 @@ def create_app(
         if not song["title"] or not song["artist"]:
             return {"found": False, "reason": "Missing title or artist metadata"}
 
+        target_dur_s = (song["duration_ms"] / 1000.0) if song["duration_ms"] > 0 else 0.0
+
+        # 1. Exact LRCLIB /api/get lookup
         params: dict[str, str | int] = {
             "track_name": song["title"],
             "artist_name": song["artist"],
         }
         if song["album"]:
             params["album_name"] = song["album"]
-        if song["duration_ms"] > 0:
-            params["duration"] = round(song["duration_ms"] / 1000)
+        if target_dur_s > 0:
+            params["duration"] = round(target_dur_s)
 
         try:
             resp = httpx.get("https://lrclib.net/api/get", params=params, timeout=8.0)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"LRCLIB lookup failed: {exc}") from exc
 
-        if resp.status_code == 404:
-            return {"found": False, "reason": "No match on LRCLIB"}
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            data = resp.json()
+            synced = (data.get("syncedLyrics") or "").strip()
+            remote_dur = float(data.get("duration") or 0)
+            dur_ok = target_dur_s <= 0 or remote_dur <= 0 or abs(remote_dur - target_dur_s) <= 8.0
+            if synced and dur_ok:
+                return {
+                    "found": True,
+                    "synced_lyrics": synced,
+                    "plain_lyrics": data.get("plainLyrics") or "",
+                    "duration_s": remote_dur,
+                    "reason": None,
+                }
+        elif resp.status_code != 404:
             raise HTTPException(status_code=502, detail=f"LRCLIB returned {resp.status_code}")
 
-        data = resp.json()
-        synced = data.get("syncedLyrics") or ""
-        remote_dur = data.get("duration") or 0
-        if song["duration_ms"] > 0 and remote_dur > 0:
-            if abs(remote_dur - (song["duration_ms"] / 1000)) > 5:
-                return {"found": False, "reason": "Duration mismatch (>5s)"}
+        # 2. Fallback to LRCLIB /api/search with cleaned title + primary artist (handles Bollywood tags / track numbers)
+        clean_title = _clean_lrclib_title(song["title"])
+        primary_artist = _primary_lrclib_artist(song["artist"])
+        search_attempts: list[dict[str, str]] = [
+            {"track_name": clean_title, "artist_name": primary_artist},
+            {"q": f"{clean_title} {primary_artist}".strip()},
+        ]
 
-        return {
-            "found": bool(synced),
-            "synced_lyrics": synced,
-            "plain_lyrics": data.get("plainLyrics") or "",
-            "duration_s": remote_dur,
-            "reason": None if synced else "Only unsynced lyrics found",
-        }
+        for attempt in search_attempts:
+            try:
+                s_resp = httpx.get("https://lrclib.net/api/search", params=attempt, timeout=8.0)
+            except httpx.HTTPError:
+                continue
+            if s_resp.status_code != 200:
+                continue
+            payload = s_resp.json()
+            if not isinstance(payload, list):
+                continue
+            match = _pick_best_lrclib_candidate(payload, target_dur_s)
+            if match:
+                return {
+                    "found": True,
+                    "synced_lyrics": (match.get("syncedLyrics") or "").strip(),
+                    "plain_lyrics": match.get("plainLyrics") or "",
+                    "duration_s": match.get("duration") or 0,
+                    "reason": None,
+                }
+
+        return {"found": False, "reason": "No synced match on LRCLIB"}
 
     @app.post("/backup", dependencies=[Depends(_require_host_token)])
     def backup_metadata():
@@ -935,7 +1005,7 @@ def create_app(
         return Response(
             content=data,
             media_type=mime,
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers={"Cache-Control": "public, max-age=86400", "Vary": "Origin"},
         )
 
     def _ensure_browser_audio(song_id: str, file_path: Path, codec: str | None) -> tuple[Path, str]:
@@ -1055,8 +1125,17 @@ def create_app(
         return Response(
             content=data,
             media_type=mime,
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers={"Cache-Control": "public, max-age=86400", "Vary": "Origin"},
         )
+
+    @app.get("/lan/rooms/{room_id}/lyrics/{host_song_id}")
+    def get_lan_room_lyrics(room_id: str, host_song_id: str):
+        if not re.fullmatch(r"[a-f0-9]{16}", host_song_id):
+            raise HTTPException(status_code=400, detail="Invalid song ID")
+        state = _lan_manager.get_room(room_id)
+        if host_song_id not in state.host_song_to_room_song_id:
+            raise HTTPException(status_code=404, detail="Song not published in room")
+        return get_lyrics(host_song_id)
 
     return app
 

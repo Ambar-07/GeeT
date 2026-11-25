@@ -63,7 +63,7 @@ export function TvStageOverlay({
           <div
             key={r.id}
             style={{ marginRight: `${r.offsetX}px` }}
-            className="animate-reaction-float inline-flex items-center gap-2 rounded-full border border-pink/35 bg-ink-900/90 px-3.5 py-1.5 text-xs shadow-[0_8px_30px_rgba(216,57,150,0.28)] backdrop-blur-md"
+            className="animate-reaction-float inline-flex items-center gap-2 rounded-full border border-white/18 bg-black/45 px-3.5 py-1.5 text-xs shadow-[0_8px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl"
           >
             <span aria-hidden="true" className="text-base leading-none">
               {REACTION_GLYPHS[r.label] ?? "✨"}
@@ -92,7 +92,7 @@ export function TvStageOverlay({
       {showProminentUpNext && nextUp && (
         <div
           role="status"
-          className="animate-toast-up pointer-events-auto absolute bottom-6 left-6 z-30 flex max-w-md items-center gap-3.5 rounded-2xl border border-sky/35 bg-ink-900/92 px-4 py-3 shadow-[0_16px_48px_rgba(0,0,0,0.65)] backdrop-blur-xl"
+          className="animate-toast-up pointer-events-auto absolute bottom-6 left-6 z-30 flex max-w-md items-center gap-3.5 rounded-2xl border border-white/18 bg-black/45 px-4 py-3 shadow-[0_16px_48px_rgba(0,0,0,0.45)] backdrop-blur-2xl"
         >
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky/15 font-mono text-xs font-bold text-sky">
             NEXT
@@ -134,12 +134,12 @@ export function TvStageOverlay({
 
       {/* Subtle TV Mode Up Next Chip when not near end */}
       {showCompactUpNext && nextUp && (
-        <div className="pointer-events-auto absolute bottom-5 left-6 inline-flex max-w-sm items-center gap-2.5 rounded-full border border-white/12 bg-ink-900/80 px-3.5 py-1.5 text-xs backdrop-blur-md">
+        <div className="pointer-events-auto absolute bottom-5 left-6 inline-flex max-w-sm items-center gap-2.5 rounded-full border border-white/15 bg-black/35 px-3.5 py-1.5 text-xs backdrop-blur-xl">
           <span className="font-mono text-[10px] uppercase tracking-wider text-sky">Next</span>
           <span className="truncate font-semibold text-snow">
             {displayTitle(nextUp.title)}
           </span>
-          <span className="shrink-0 text-snow/50">({nextUp.requester})</span>
+          <span className="shrink-0 text-snow/60">({nextUp.requester})</span>
         </div>
       )}
 
@@ -150,7 +150,7 @@ export function TvStageOverlay({
             <button
               type="button"
               onClick={() => setQrMinimized(false)}
-              className="flex items-center gap-2.5 rounded-full border border-white/18 bg-ink-900/88 px-3.5 py-2 text-xs shadow-xl backdrop-blur-xl transition hover:border-sky/60"
+              className="flex items-center gap-2.5 rounded-full border border-white/18 bg-black/40 px-3.5 py-2 text-xs shadow-xl backdrop-blur-2xl transition hover:bg-black/55"
             >
               <span className="font-mono text-xs font-bold tracking-wider text-snow">
                 {roomInfo.roomCode}
@@ -160,10 +160,10 @@ export function TvStageOverlay({
                 transport={roomInfo.transport}
                 compact
               />
-              <span className="text-[11px] text-snow/55">QR</span>
+              <span className="text-[11px] text-snow/65">QR</span>
             </button>
           ) : (
-            <div className="flex items-center gap-3.5 rounded-2xl border border-white/15 bg-ink-900/88 p-3 shadow-[0_16px_48px_rgba(0,0,0,0.65)] backdrop-blur-xl">
+            <div className="flex items-center gap-3.5 rounded-2xl border border-white/16 bg-black/42 p-3 shadow-[0_16px_48px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
               {roomInfo.qrDataUrl && (
                 <div className="shrink-0 rounded-xl bg-snow p-1.5 shadow-inner">
                   <img

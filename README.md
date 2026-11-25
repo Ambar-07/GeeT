@@ -1,11 +1,41 @@
 # GeeT Karaoke Platform
 
-GeeT is a room-based karaoke architecture operating on a zero-recurring-cost infrastructure model:
-- Frontend: Cloudflare Pages (React, Vite, TypeScript, Tailwind CSS)
-- Coordination & State: Supabase Free Tier (PostgreSQL, Row Level Security, Realtime, Database Functions)
-- Media & Processing: Local Host Agent (FastAPI, SQLite, Mutagen, FFmpeg/FFprobe, Demucs)
+GeeT turns your local music library into an Apple Music Sing–inspired karaoke stage with zero recurring cloud cost:
+- **Frontend**: React 19, Vite, TypeScript, Tailwind CSS, and a 60 FPS WebGL fluid album-art shader
+- **Party Sync**: Zero-cloud **LAN Party Mode** (host-agent WebSockets over Wi-Fi) + optional **Supabase Free Tier** (PostgreSQL, RLS, Realtime)
+- **Local Host Agent**: FastAPI, SQLite, Mutagen, bundled FFmpeg (transparent ALAC/EC-3 → cached AAC playback), and **Demucs** vocal/instrumental stem separation
 
-Audio files, processed stems, full library paths, and local credentials remain strictly on the host system. Supabase stores only ephemeral room states and published metadata for active sessions.
+Audio files, processed stems, full library paths, and local credentials remain strictly on the host system.
+
+---
+
+## Screenshots
+
+### TV Stage Mode (WebGL Fluid Album-Art Backdrop & Frosted QR Overlay)
+![GeeT TV Stage Mode](docs/screenshots/tv-stage.png)
+
+### Host Console — Library & Shuffle
+![GeeT Host Library](docs/screenshots/host-library.png)
+
+### Host Console — Live Party Room
+![GeeT Host Party Room](docs/screenshots/host-party.png)
+
+### Guest Phone Companion (Live Follow-Along Lyrics & Reactions)
+<p align="center">
+  <img src="docs/screenshots/guest-mobile.png" alt="GeeT Guest Phone View" width="340" />
+</p>
+
+### Home
+![GeeT Home](docs/screenshots/home.png)
+
+---
+
+## Highlights
+- **Apple Music Sing Stage**: Real-time WebGL fluid-warp shader (`FluidCoverCanvas`) driven by each track's embedded album art, 60 FPS lyric sweep, and 3-dot intro/interlude breather cues.
+- **Smart Lyrics Pipeline**: Automatic LRCLIB synced-lyrics lookup with cleaned title/artist fallback, embedded tag fallback (`©lyr` / `USLT`), offset calibration, and offline **Devanagari → Hinglish (`अ / A`)** transliteration toggle.
+- **Local Instrumental Separation & Vocal Mix**: On-device Demucs separation with live `0%–100%` guide-vocal mix slider and background Auto-Prepare for the next 1–2 queued tracks.
+- **LAN & Cloud Party Rooms**: Friends scan the QR code on Wi-Fi to browse the catalogue, queue songs, send live floating reactions, get **"You're Up Next!" / "You're On Stage!"** alerts, and read **live follow-along lyrics** right on their phone.
+- **Full-Library Shuffle**: Fisher-Yates bag shuffle across all indexed tracks with history navigation (`<<`), auto-advance, and automatic Party Queue priority.
 
 ---
 

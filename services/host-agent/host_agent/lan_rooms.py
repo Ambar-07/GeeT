@@ -114,6 +114,7 @@ class PlaybackCheckpointRequest(BaseModel):
     status: str
     position_ms: int = Field(default=0, ge=0)
     capability: str
+    host_song_id: str | None = None
 
 
 class ReactionRequest(BaseModel):
@@ -504,9 +505,19 @@ def create_lan_router(
             raise HTTPException(status_code=400, detail="Invalid playback status")
         rev = state.bump_revision()
         playing = next((q for q in state.queue if q["status"] == "playing"), None)
+        explicit_song_id = (
+            state.host_song_to_room_song_id.get(req.host_song_id)
+            if req.host_song_id
+            else None
+        )
+        resolved_song_id = (
+            explicit_song_id
+            or (playing["song_id"] if playing else None)
+            or state.playback.get("song_id")
+        )
         state.playback = {
             "room_id": state.room["id"],
-            "song_id": playing["song_id"] if playing else state.playback.get("song_id"),
+            "song_id": resolved_song_id,
             "status": req.status,
             "position_ms": req.position_ms,
             "revision": rev,
@@ -549,6 +560,13 @@ def create_lan_router(
                     await manager.broadcast_reaction(
                         state, sender, label, rate_key=f"ws:{client_uid}"
                     )
+                elif msg_type == "lyrics_sync" and client_uid == state.room["host_user_id"]:
+                    payload = data.get("payload")
+                    if isinstance(payload, dict):
+                        await manager._broadcast(
+                            state,
+                            {"type": "lyrics_sync", "payload": payload},
+                        )
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
         except WebSocketDisconnect:

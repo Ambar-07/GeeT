@@ -290,11 +290,31 @@ export function reconcileSnapshot(
   return incoming.room.revision >= current.room.revision ? incoming : current;
 }
 
+export interface LiveLyricsSyncPayload {
+  hostSongId: string;
+  title?: string;
+  artist?: string;
+  lrcText: string;
+  offsetMs: number;
+  status?: "idle" | "playing" | "paused" | "ended";
+  positionMs?: number;
+  sentAtMs?: number;
+}
+
 export interface RoomSubscriptionCallbacks {
   onSnapshot: (snap: RoomSnapshot) => void;
   onPresenceCount: (onlineUserIds: string[]) => void;
   onReaction: (payload: { sender: string; label: string }) => void;
   onConnectionState: (state: "connecting" | "subscribed" | "disconnected") => void;
+  onLyricsSync?: (payload: LiveLyricsSyncPayload) => void;
+  onLyricsRequest?: () => void;
+}
+
+export interface RoomSubscriptionHandle {
+  sendReaction: (label: string) => void;
+  sendLyricsSync: (payload: LiveLyricsSyncPayload) => void;
+  requestLyricsSync: () => void;
+  unsubscribe: () => void;
 }
 
 export function subscribeToRoom(
@@ -302,7 +322,7 @@ export function subscribeToRoom(
   userId: string,
   displayName: string,
   callbacks: RoomSubscriptionCallbacks
-): { sendReaction: (label: string) => void; unsubscribe: () => void } {
+): RoomSubscriptionHandle {
   const client = requireSupabase();
   let lastReactionAt = 0;
 
@@ -360,6 +380,24 @@ export function subscribeToRoom(
         callbacks.onReaction({ sender: String(payload.sender), label: String(payload.label) });
       }
     })
+    .on("broadcast", { event: "lyrics_sync" }, ({ payload }) => {
+      telemetry.realtimeMessages += 1;
+      if (payload?.hostSongId && typeof payload.lrcText === "string") {
+        callbacks.onLyricsSync?.({
+          hostSongId: String(payload.hostSongId),
+          title: payload.title ? String(payload.title) : undefined,
+          artist: payload.artist ? String(payload.artist) : undefined,
+          lrcText: payload.lrcText,
+          offsetMs: Number(payload.offsetMs ?? 0),
+          status: payload.status,
+          positionMs: typeof payload.positionMs === "number" ? payload.positionMs : undefined,
+          sentAtMs: typeof payload.sentAtMs === "number" ? payload.sentAtMs : undefined,
+        });
+      }
+    })
+    .on("broadcast", { event: "lyrics_request" }, () => {
+      callbacks.onLyricsRequest?.();
+    })
     .subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         callbacks.onConnectionState("subscribed");
@@ -381,6 +419,22 @@ export function subscribeToRoom(
         type: "broadcast",
         event: "reaction",
         payload: { sender: displayName, label },
+      });
+    },
+    sendLyricsSync(payload: LiveLyricsSyncPayload) {
+      telemetry.realtimeMessages += 1;
+      void channel.send({
+        type: "broadcast",
+        event: "lyrics_sync",
+        payload: { ...payload, sentAtMs: Date.now() },
+      });
+    },
+    requestLyricsSync() {
+      telemetry.realtimeMessages += 1;
+      void channel.send({
+        type: "broadcast",
+        event: "lyrics_request",
+        payload: { requester: userId },
       });
     },
     unsubscribe() {

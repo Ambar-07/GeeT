@@ -1,17 +1,21 @@
 import {
+  LyricsRecordSchema,
   PlaybackStateSchema,
   QueueEntrySchema,
   RoomParticipantSchema,
   RoomSchema,
   RoomSongSchema,
   type HostSong,
+  type LyricsRecord,
   type RoomStatus,
 } from "@geet/shared";
 import { z } from "zod";
 import {
   storeHostCapability,
+  type LiveLyricsSyncPayload,
   type RoomSnapshot,
   type RoomSubscriptionCallbacks,
+  type RoomSubscriptionHandle,
 } from "./rooms";
 
 const LAN_API_BASE = "/lan-api";
@@ -241,11 +245,22 @@ export async function advanceLanRoomQueue(
   return data.revision;
 }
 
+export async function fetchLanRoomLyrics(
+  roomId: string,
+  hostSongId: string
+): Promise<LyricsRecord> {
+  const raw = await lanFetch<unknown>(
+    `/rooms/${encodeURIComponent(roomId)}/lyrics/${encodeURIComponent(hostSongId)}`
+  );
+  return LyricsRecordSchema.parse(raw);
+}
+
 export async function syncLanPlaybackCheckpoint(
   roomId: string,
   status: "idle" | "playing" | "paused" | "ended",
   positionMs: number,
-  capability: string
+  capability: string,
+  hostSongId?: string
 ): Promise<number> {
   const data = await lanFetch<{ revision: number }>(
     `/rooms/${encodeURIComponent(roomId)}/playback`,
@@ -256,6 +271,7 @@ export async function syncLanPlaybackCheckpoint(
         status,
         position_ms: Math.max(0, Math.round(positionMs)),
         capability,
+        host_song_id: hostSongId ?? null,
       }),
     }
   );
@@ -267,7 +283,7 @@ export function subscribeToLanRoom(
   userId: string,
   displayName: string,
   callbacks: RoomSubscriptionCallbacks
-): { sendReaction: (label: string) => void; unsubscribe: () => void } {
+): RoomSubscriptionHandle {
   let closed = false;
   let ws: WebSocket | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -313,6 +329,22 @@ export function subscribeToLanRoom(
             sender: String(msg.payload.sender),
             label: String(msg.payload.label),
           });
+        } else if (
+          msg?.type === "lyrics_sync" &&
+          msg.payload?.hostSongId &&
+          typeof msg.payload.lrcText === "string"
+        ) {
+          callbacks.onLyricsSync?.({
+            hostSongId: String(msg.payload.hostSongId),
+            title: msg.payload.title ? String(msg.payload.title) : undefined,
+            artist: msg.payload.artist ? String(msg.payload.artist) : undefined,
+            lrcText: msg.payload.lrcText,
+            offsetMs: Number(msg.payload.offsetMs ?? 0),
+            status: msg.payload.status,
+            positionMs:
+              typeof msg.payload.positionMs === "number" ? msg.payload.positionMs : undefined,
+            sentAtMs: typeof msg.payload.sentAtMs === "number" ? msg.payload.sentAtMs : undefined,
+          });
         }
       } catch {
         // Ignore malformed frames
@@ -357,6 +389,19 @@ export function subscribeToLanRoom(
           body: JSON.stringify({ sender: displayName || "Guest", label }),
         }).catch(() => {});
       }
+    },
+    sendLyricsSync(payload: LiveLyricsSyncPayload) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "lyrics_sync",
+            payload: { ...payload, sentAtMs: Date.now() },
+          })
+        );
+      }
+    },
+    requestLyricsSync() {
+      // LAN guests fetch directly via HTTP /lan-api/rooms/{id}/lyrics/{hostSongId}
     },
     unsubscribe() {
       closed = true;

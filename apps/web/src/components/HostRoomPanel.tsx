@@ -48,6 +48,15 @@ export interface PlaybackEventSignal {
   type: "playing" | "paused" | "ended";
   positionMs: number;
   seq: number;
+  hostSongId?: string;
+}
+
+export interface HostActiveLyrics {
+  songId: string;
+  title: string;
+  artist: string;
+  lrcText: string;
+  offsetMs: number;
 }
 
 export interface StageReactionBurst {
@@ -85,6 +94,8 @@ interface HostRoomPanelProps {
   hostConnected: boolean;
   onPlayHostSong: (hostSongId: string) => void;
   playbackSignal: PlaybackEventSignal | null;
+  activeLyrics?: HostActiveLyrics | null;
+  getPlaybackClock?: () => { status: "idle" | "playing" | "paused" | "ended"; positionMs: number };
   onStageRoomChange?: (info: HostStageRoomInfo) => void;
   onReactionBurst?: (burst: StageReactionBurst) => void;
 }
@@ -93,6 +104,8 @@ export function HostRoomPanel({
   hostConnected,
   onPlayHostSong,
   playbackSignal,
+  activeLyrics,
+  getPlaybackClock,
   onStageRoomChange,
   onReactionBurst,
 }: HostRoomPanelProps) {
@@ -117,6 +130,27 @@ export function HostRoomPanel({
   const lastPlayingEntryIdRef = useRef<string | null>(null);
   const onReactionBurstRef = useRef(onReactionBurst);
   onReactionBurstRef.current = onReactionBurst;
+  const activeLyricsRef = useRef(activeLyrics);
+  activeLyricsRef.current = activeLyrics;
+  const getPlaybackClockRef = useRef(getPlaybackClock);
+  getPlaybackClockRef.current = getPlaybackClock;
+  const sendLyricsSyncRef = useRef<((payload: import("../lib/rooms").LiveLyricsSyncPayload) => void) | null>(null);
+
+  const pushLiveLyrics = useCallback(() => {
+    const lyr = activeLyricsRef.current;
+    const send = sendLyricsSyncRef.current;
+    if (!lyr || !send) return;
+    const clock = getPlaybackClockRef.current?.();
+    send({
+      hostSongId: lyr.songId,
+      title: lyr.title,
+      artist: lyr.artist,
+      lrcText: lyr.lrcText,
+      offsetMs: lyr.offsetMs,
+      status: clock?.status ?? "playing",
+      positionMs: clock?.positionMs ?? 0,
+    });
+  }, []);
 
   useEffect(() => {
     if (transport !== "lan" || !hostConnected) return;
@@ -198,7 +232,9 @@ export function HostRoomPanel({
             onConnectionState: (st) => {
               if (active) setConnState(st);
             },
+            onLyricsRequest: () => pushLiveLyrics(),
           });
+          sendLyricsSyncRef.current = sub.sendLyricsSync;
           unsub = sub.unsubscribe;
         } else {
           const { userId } = await ensureAuthSession();
@@ -214,7 +250,9 @@ export function HostRoomPanel({
             onConnectionState: (st) => {
               if (active) setConnState(st);
             },
+            onLyricsRequest: () => pushLiveLyrics(),
           });
+          sendLyricsSyncRef.current = sub.sendLyricsSync;
           unsub = sub.unsubscribe;
         }
       } catch (err) {
@@ -230,9 +268,10 @@ export function HostRoomPanel({
 
     return () => {
       active = false;
+      sendLyricsSyncRef.current = null;
       unsub?.();
     };
-  }, [roomId, transport, fetchSnapshotForMode, handleIncomingReaction]);
+  }, [roomId, transport, fetchSnapshotForMode, handleIncomingReaction, pushLiveLyrics]);
 
   const songMap = useMemo(
     () => new Map((snapshot?.songs ?? []).map((s) => [s.id, s])),
@@ -269,10 +308,30 @@ export function HostRoomPanel({
 
     const syncPromise =
       transport === "lan"
-        ? syncLanPlaybackCheckpoint(roomId, playbackSignal.type, playbackSignal.positionMs, cap)
+        ? syncLanPlaybackCheckpoint(
+            roomId,
+            playbackSignal.type,
+            playbackSignal.positionMs,
+            cap,
+            playbackSignal.hostSongId
+          )
         : syncPlaybackCheckpoint(roomId, playbackSignal.type, playbackSignal.positionMs, cap);
     void syncPromise.catch(() => {});
-  }, [playbackSignal, roomId, snapshot?.room.status, transport, fetchSnapshotForMode]);
+    pushLiveLyrics();
+  }, [playbackSignal, roomId, snapshot?.room.status, transport, fetchSnapshotForMode, pushLiveLyrics]);
+
+  // Broadcast live lyrics immediately whenever the host loads, auto-fetches, edits, or calibrates lyrics
+  useEffect(() => {
+    if (!roomId || connState !== "subscribed" || !activeLyrics) return;
+    pushLiveLyrics();
+  }, [
+    roomId,
+    connState,
+    activeLyrics?.songId,
+    activeLyrics?.lrcText,
+    activeLyrics?.offsetMs,
+    pushLiveLyrics,
+  ]);
 
   const refreshSnapshotNow = useCallback(
     async (id: string, mode = transport) => {
@@ -313,6 +372,18 @@ export function HostRoomPanel({
         const published = await publishAllLocalSongs(created.roomId, "lan", created.hostCapability).catch(
           () => 0
         );
+        // Immediately sync any song already playing on the host stage so guests see Now Playing & Live Lyrics
+        const curLyr = activeLyricsRef.current;
+        const curClock = getPlaybackClockRef.current?.();
+        if (curLyr?.songId && curClock && curClock.status !== "idle") {
+          await syncLanPlaybackCheckpoint(
+            created.roomId,
+            curClock.status,
+            curClock.positionMs,
+            created.hostCapability,
+            curLyr.songId
+          ).catch(() => {});
+        }
         await refreshSnapshotNow(created.roomId, "lan");
         setMsg(
           published > 0
@@ -509,7 +580,7 @@ export function HostRoomPanel({
   }
 
   return (
-    <section className="rounded-xl border border-white/[0.08] bg-ink-850 p-3.5 space-y-3">
+    <section className="flex min-h-0 flex-1 flex-col gap-3.5 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 backdrop-blur-xl">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <h2 className="eyebrow">Party Room</h2>
@@ -570,23 +641,23 @@ export function HostRoomPanel({
         <>
           <div className="flex items-center gap-3">
             {qrDataUrl && (
-              <div className="shrink-0 rounded-xl bg-snow p-1.5 shadow">
+              <div className="shrink-0 rounded-xl bg-white p-1.5 shadow-md">
                 <img
                   src={qrDataUrl}
                   alt={`Join room ${snapshot.room.code}`}
-                  className="h-[74px] w-[74px]"
+                  className="h-[64px] w-[64px]"
                 />
               </div>
             )}
-            <div className="min-w-0 flex-1 space-y-1 text-xs">
+            <div className="min-w-0 flex-1 space-y-0.5 text-xs">
               <div className="flex items-center gap-2">
-                <span className="font-mono text-lg font-bold tracking-wider text-snow">
+                <span className="font-mono text-base font-bold tracking-wider text-snow">
                   {snapshot.room.code}
                 </span>
                 <button
                   type="button"
                   onClick={() => void handleCopyJoinUrl()}
-                  className="rounded border border-white/15 px-1.5 py-0.5 font-mono text-[10px] text-snow/70 transition hover:border-sky hover:text-snow"
+                  className="rounded-full border border-white/15 bg-white/[0.06] px-2 py-0.5 text-[10px] font-medium text-snow/80 transition hover:bg-white/15 hover:text-white"
                 >
                   {copied ? "Copied" : "Copy URL"}
                 </button>
@@ -654,9 +725,9 @@ export function HostRoomPanel({
             </button>
           </div>
 
-          <div className="border-t border-white/8 pt-2.5 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="font-mono text-[10px] uppercase tracking-wider text-snow/55">
+          <div className="flex min-h-0 flex-1 flex-col space-y-2 border-t border-white/8 pt-3">
+            <div className="flex shrink-0 items-center justify-between">
+              <span className="text-xs font-semibold text-white/70">
                 Up Next ({queuedEntries.length})
               </span>
               <div className="flex gap-1.5">
@@ -664,7 +735,7 @@ export function HostRoomPanel({
                   type="button"
                   disabled={busy || queuedEntries.length === 0}
                   onClick={() => void handleAdvance("next")}
-                  className="btn-primary px-2.5 py-0.5 text-[10px]"
+                  className="btn-primary px-3 py-1 text-[11px]"
                 >
                   Play Next
                 </button>
@@ -672,7 +743,7 @@ export function HostRoomPanel({
                   type="button"
                   disabled={busy || (!playingEntry && queuedEntries.length === 0)}
                   onClick={() => void handleAdvance("skip")}
-                  className="btn-ghost px-2.5 py-0.5 text-[10px]"
+                  className="btn-ghost px-3 py-1 text-[11px]"
                 >
                   Skip
                 </button>
@@ -680,11 +751,11 @@ export function HostRoomPanel({
             </div>
 
             {queuedEntries.length === 0 ? (
-              <p className="text-[11px] text-snow/40">
+              <p className="py-6 text-center text-xs text-white/40">
                 Waiting for guests to pick songs...
               </p>
             ) : (
-              <ul className="thin-scroll max-h-[140px] divide-y divide-white/6 overflow-y-auto pr-1">
+              <ul className="thin-scroll min-h-0 flex-1 divide-y divide-white/6 overflow-y-auto pr-1">
                 {queuedEntries.map((entry, idx) => {
                   const song = songMap.get(entry.song_id);
                   const requester = participantMap.get(entry.requested_by) ?? "Guest";

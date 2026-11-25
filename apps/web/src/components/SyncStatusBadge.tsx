@@ -43,7 +43,7 @@ export function SyncStatusBadge({
     <span
       role="status"
       aria-label={`Sync status: ${config.text}`}
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] ${config.tone}`}
+      className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] ${config.tone}`}
     >
       <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
       <span>{config.text}</span>

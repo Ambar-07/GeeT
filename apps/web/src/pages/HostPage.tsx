@@ -10,13 +10,13 @@ import {
 } from "../components/Cover";
 import {
   HostRoomPanel,
+  type HostActiveLyrics,
   type HostStageRoomInfo,
   type PlaybackEventSignal,
   type StageReactionBurst,
   type UpNextItem,
 } from "../components/HostRoomPanel";
 import { LyricsPanel } from "../components/LyricsPanel";
-import { SyncStatusBadge } from "../components/SyncStatusBadge";
 import { TvStageOverlay } from "../components/TvStageOverlay";
 import {
   backupMetadata,
@@ -37,6 +37,15 @@ function formatSec(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function shuffleList<T>(items: readonly T[]): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 /** Pick the first of the next 2 queued tracks that still needs stem separation. */
@@ -74,8 +83,11 @@ export function HostPage() {
   const [autoPrepareEnabled, setAutoPrepareEnabled] = useState(true);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [playbackSignal, setPlaybackSignal] = useState<PlaybackEventSignal | null>(null);
+  const [activeLyrics, setActiveLyrics] = useState<HostActiveLyrics | null>(null);
   const [tvMode, setTvMode] = useState(false);
   const [showTvOverlay, setShowTvOverlay] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<"library" | "party">("library");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [lyricsEditorOpen, setLyricsEditorOpen] = useState(false);
   const [stemMenuOpen, setStemMenuOpen] = useState(false);
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
@@ -88,6 +100,7 @@ export function HostPage() {
   const [durationSec, setDurationSec] = useState(0);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
+  const [shuffleEnabled, setShuffleEnabled] = useState(false);
   const [vocalMix, setVocalMix] = useState(0.15);
   const [showVocalSlider, setShowVocalSlider] = useState(false);
 
@@ -95,6 +108,9 @@ export function HostPage() {
   const vocalAudioRef = useRef<HTMLAudioElement | null>(null);
   const resumePosRef = useRef<number | null>(null);
   const songsRef = useRef<HostSong[]>([]);
+  const shufflePoolRef = useRef<HostSong[]>([]);
+  const shuffleBagRef = useRef<HostSong[]>([]);
+  const shuffleHistoryRef = useRef<HostSong[]>([]);
   const autoPreparedIdsRef = useRef<Set<string>>(new Set());
   songsRef.current = songs;
 
@@ -120,10 +136,42 @@ export function HostPage() {
     }, 3400);
   }, []);
 
-  function emitPlayback(type: PlaybackEventSignal["type"]) {
+  const activeSongRef = useRef<HostSong | null>(null);
+  activeSongRef.current = activeSong;
+
+  function emitPlayback(type: PlaybackEventSignal["type"], songIdOverride?: string) {
     const posMs = Math.round((audioRef.current?.currentTime ?? 0) * 1000);
-    setPlaybackSignal((prev) => ({ type, positionMs: posMs, seq: (prev?.seq ?? 0) + 1 }));
+    setPlaybackSignal((prev) => ({
+      type,
+      positionMs: posMs,
+      seq: (prev?.seq ?? 0) + 1,
+      hostSongId: songIdOverride ?? activeSongRef.current?.id,
+    }));
   }
+
+  const getPlaybackClock = useCallback(() => {
+    const audio = audioRef.current;
+    const status: "idle" | "playing" | "paused" | "ended" = !audio
+      ? "idle"
+      : audio.ended
+        ? "ended"
+        : audio.paused
+          ? "paused"
+          : "playing";
+    return {
+      status,
+      positionMs: Math.round((audio?.currentTime ?? 0) * 1000),
+    };
+  }, []);
+
+  // Gentle periodic clock sync while playing so guest phones stay tightly aligned
+  useEffect(() => {
+    if (!isPlaying || !activeSong || !stageRoom?.active) return;
+    const timer = setInterval(() => {
+      emitPlayback("playing", activeSong.id);
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [isPlaying, activeSong?.id, stageRoom?.active]);
 
   async function refresh(searchQuery = query) {
     try {
@@ -138,9 +186,23 @@ export function HostPage() {
     }
   }
 
+  const didMountQueryRef = useRef(false);
+
   useEffect(() => {
     void refresh("");
   }, []);
+
+  // Live debounced search as you type (no redundant Search button needed)
+  useEffect(() => {
+    if (!didMountQueryRef.current) {
+      didMountQueryRef.current = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      void refresh(query);
+    }, 220);
+    return () => clearTimeout(timer);
+  }, [query]);
 
   // Keep primary + companion vocal stem audio volumes synced
   useEffect(() => {
@@ -170,6 +232,8 @@ export function HostPage() {
         setShowTvOverlay((v) => !v);
       } else if (e.key === "m" || e.key === "M") {
         setMuted((v) => !v);
+      } else if (e.key === "s" || e.key === "S") {
+        setShuffleEnabled((v) => !v);
       } else if (e.key === "ArrowRight" && audioRef.current) {
         e.preventDefault();
         audioRef.current.currentTime = Math.min(
@@ -262,16 +326,74 @@ export function HostPage() {
     setStemMenuOpen(false);
   }
 
+  async function ensureShufflePool(): Promise<HostSong[]> {
+    if (shufflePoolRef.current.length > 0) return shufflePoolRef.current;
+    try {
+      const all: HostSong[] = [];
+      let cursor: string | null = null;
+      do {
+        const page = await fetchSongsPage("", cursor);
+        all.push(...page.songs);
+        cursor = page.next_cursor;
+      } while (cursor);
+      const playable = all.filter((s) => s.readiness !== "drm_rejected");
+      shufflePoolRef.current = playable;
+      return playable;
+    } catch {
+      return songsRef.current;
+    }
+  }
+
+  async function playNextShuffled(recordHistory = true) {
+    const pool = await ensureShufflePool();
+    if (pool.length === 0) return;
+
+    const currentId = activeSongRef.current?.id;
+    if (shuffleBagRef.current.length === 0) {
+      const fresh = shuffleList(pool.filter((s) => pool.length === 1 || s.id !== currentId));
+      shuffleBagRef.current = fresh;
+    }
+
+    const next = shuffleBagRef.current.pop();
+    if (!next) return;
+    if (recordHistory && activeSongRef.current) {
+      shuffleHistoryRef.current = [...shuffleHistoryRef.current.slice(-40), activeSongRef.current];
+    }
+    selectSongForPlayback(next);
+  }
+
+  async function handleShufflePlay() {
+    setShuffleEnabled(true);
+    await playNextShuffled(true);
+  }
+
   function stepLibraryTrack(delta: -1 | 1) {
-    if (!activeSong || songs.length === 0) return;
+    if (!activeSong) return;
     if (delta === 1 && stageRoom?.playNext) {
       stageRoom.playNext();
       return;
     }
-    const idx = songs.findIndex((s) => s.id === activeSong.id);
-    if (idx === -1) return;
     if (delta === -1 && audioRef.current && audioRef.current.currentTime > 4) {
       audioRef.current.currentTime = 0;
+      return;
+    }
+    if (shuffleEnabled) {
+      if (delta === 1) {
+        void playNextShuffled(true);
+      } else {
+        const prev = shuffleHistoryRef.current.pop();
+        if (prev) {
+          selectSongForPlayback(prev);
+        } else if (audioRef.current) {
+          audioRef.current.currentTime = 0;
+        }
+      }
+      return;
+    }
+    if (songs.length === 0) return;
+    const idx = songs.findIndex((s) => s.id === activeSong.id);
+    if (idx === -1) {
+      selectSongForPlayback(songs[0]);
       return;
     }
     const nextIdx = (idx + delta + songs.length) % songs.length;
@@ -334,6 +456,8 @@ export function HostPage() {
     try {
       await selectLibraryFolder(folderPath.trim());
       const res = await scanLibrary();
+      shufflePoolRef.current = [];
+      shuffleBagRef.current = [];
       setStatusMsg(`Imported ${res.scanned + res.skipped_unchanged} tracks.`);
       await refresh();
     } catch (err) {
@@ -381,27 +505,18 @@ export function HostPage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-ink-950 text-snow lg:h-screen lg:overflow-hidden">
-      {/* Top App Bar (hidden in TV Stage Mode so the atmospheric stage goes truly full-bleed) */}
+      {/* Minimalist Top Bar (hidden in TV Stage Mode so the stage goes truly full-bleed) */}
       {!tvMode && (
-        <header className="z-30 flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/[0.08] bg-ink-900/95 px-4 py-2.5 backdrop-blur-md sm:px-5">
-          <div className="flex items-center gap-3">
-            <Link to="/">
-              <Logo size={24} />
-            </Link>
-            <span className="text-white/15">/</span>
-            <h1 className="text-sm font-semibold text-snow/85">Host Console</h1>
-          </div>
+        <header className="relative z-30 flex shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] bg-ink-950/90 px-4 py-2.5 backdrop-blur-xl sm:px-5">
+          <Link to="/" className="shrink-0">
+            <Logo size={25} />
+          </Link>
 
-          <div className="flex items-center gap-2 rounded-full border border-white/10 bg-ink-850 px-3.5 py-1 text-xs">
+          <div className="hidden items-center gap-2 text-xs sm:flex">
             {health ? (
-              <span role="status" className="flex items-center gap-2 font-medium text-snow/85">
-                <span className="h-2 w-2 rounded-full bg-sky shadow-[0_0_8px_rgba(5,147,198,0.8)]" />
+              <span role="status" className="flex items-center gap-2 font-medium text-white/55">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]" />
                 Connected • {health.song_count} songs
-                {health.demucs && (
-                  <span className="hidden rounded bg-white/8 px-1.5 py-0.5 font-mono text-[10px] uppercase text-snow/65 sm:inline">
-                    {health.compute_device ?? "cpu"}
-                  </span>
-                )}
               </span>
             ) : (
               <span role="alert" className="text-pink">
@@ -410,154 +525,297 @@ export function HostPage() {
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 text-xs">
+          <div className="flex items-center gap-2 text-xs">
+            <div className="relative">
+              <button
+                type="button"
+                aria-label="Library & settings"
+                aria-expanded={settingsOpen}
+                title="Library & Settings"
+                onClick={() => setSettingsOpen((v) => !v)}
+                className={`flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                  settingsOpen
+                    ? "border-white/25 bg-white/14 text-white"
+                    : "border-white/10 bg-white/[0.05] text-white/70 hover:bg-white/10 hover:text-white"
+                }`}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.66 0-1.25.4-1.51 1Z" />
+                </svg>
+              </button>
+
+              {settingsOpen && (
+                <div className="absolute right-0 top-10 z-50 w-80 space-y-3.5 rounded-2xl border border-white/14 bg-ink-900/96 p-4 shadow-[0_24px_60px_rgba(0,0,0,0.65)] backdrop-blur-2xl">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-white">Library & Settings</span>
+                    <button
+                      type="button"
+                      aria-label="Close settings"
+                      onClick={() => setSettingsOpen(false)}
+                      className="text-xs text-white/45 hover:text-white"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <form onSubmit={handleAddAndScan} className="space-y-2">
+                    <label className="block text-[11px] text-white/55">Music Folder</label>
+                    <div className="flex gap-1.5">
+                      <input
+                        aria-label="Local music folder path"
+                        value={folderPath}
+                        onChange={(e) => setFolderPath(e.target.value)}
+                        placeholder="D:\Music"
+                        className="field py-1.5 text-xs"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!health}
+                        className="btn-light shrink-0 px-3.5 py-1.5 text-[11px]"
+                      >
+                        Add & Scan
+                      </button>
+                    </div>
+                  </form>
+
+                  <div className="flex items-center justify-between border-t border-white/8 pt-3">
+                    <div>
+                      <p className="text-xs font-medium text-white/85">Auto-Prepare Stems</p>
+                      <p className="text-[11px] text-white/45">Pre-separate next 2 queued tracks</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAutoPrepareEnabled((v) => !v)}
+                      className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
+                        autoPrepareEnabled && health?.demucs
+                          ? "bg-white text-ink-950"
+                          : "bg-white/10 text-white/60 hover:text-white"
+                      }`}
+                    >
+                      {autoPrepareEnabled ? "On" : "Off"}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2 border-t border-white/8 pt-3">
+                    <button
+                      type="button"
+                      onClick={() => void refresh()}
+                      className="btn-ghost flex-1 py-1.5 text-[11px]"
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!health}
+                      onClick={() =>
+                        void backupMetadata()
+                          .then((b) =>
+                            setStatusMsg(`SQLite backup saved: ${b.filename} (${b.size_bytes} bytes).`)
+                          )
+                          .catch((err) =>
+                            setStatusMsg(err instanceof Error ? err.message : "Backup failed")
+                          )
+                      }
+                      className="btn-ghost flex-1 py-1.5 text-[11px]"
+                    >
+                      Backup DB
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button
               type="button"
-              disabled={!health}
-              onClick={() =>
-                void backupMetadata()
-                  .then((b) =>
-                    setStatusMsg(`SQLite backup saved: ${b.filename} (${b.size_bytes} bytes).`)
-                  )
-                  .catch((err) => setStatusMsg(err instanceof Error ? err.message : "Backup failed"))
-              }
-              className="btn-ghost px-3 py-1.5 text-[11px]"
-            >
-              Backup DB
-            </button>
-            <button
-              type="button"
-              onClick={() => void refresh()}
-              className="btn-ghost px-3 py-1.5 text-[11px]"
-            >
-              Refresh
-            </button>
-            <button
-              type="button"
-              onClick={() => setTvMode(true)}
-              className="btn-primary px-4 py-1.5 text-[11px]"
+              onClick={() => {
+                setSettingsOpen(false);
+                setTvMode(true);
+              }}
+              className="btn-primary px-4 py-1.5 text-xs"
               title="Enter Full-Screen TV Stage Mode (T)"
             >
               TV Stage Mode
             </button>
-            <Link to="/" className="btn-ghost px-3 py-1.5 text-[11px]">
-              Home
-            </Link>
           </div>
         </header>
       )}
 
       {/* Main App Workspace */}
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        {/* Left Library + Party Sidebar — kept mounted when tvMode=true so room sync never disconnects */}
+        {/* Left Clean Segmented Sidebar (Library | Party) — kept mounted in TV mode so room sync never disconnects */}
         <aside
           aria-hidden={tvMode}
           className={`${
             tvMode ? "hidden" : "flex"
-          } w-full shrink-0 flex-col border-b border-white/[0.08] bg-ink-900 p-4 lg:h-full lg:w-[376px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
+          } w-full shrink-0 flex-col border-b border-white/[0.06] bg-ink-900/95 p-3.5 lg:h-full lg:w-[348px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
         >
-          <div className="flex min-h-0 flex-1 flex-col gap-3.5">
-            {/* Search Library */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void refresh(query);
-              }}
-              className="flex shrink-0 gap-1.5"
+          {/* Segmented Library / Party Switch */}
+          <div
+            role="tablist"
+            aria-label="Sidebar view"
+            className="mb-3 grid shrink-0 grid-cols-2 rounded-full border border-white/[0.08] bg-white/[0.04] p-1"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sidebarTab === "library"}
+              onClick={() => setSidebarTab("library")}
+              className={`rounded-full py-1.5 text-xs font-semibold transition ${
+                sidebarTab === "library"
+                  ? "bg-white text-ink-950 shadow-sm"
+                  : "text-white/60 hover:text-white"
+              }`}
             >
-              <input
-                aria-label="Search indexed songs"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search title, artist, or album..."
-                className="field py-1.5 text-xs"
-              />
-              <button type="submit" className="btn-ghost shrink-0 px-3 py-1.5 text-[11px]">
-                Search
-              </button>
-            </form>
-
-            {/* Folder Import */}
-            <div className="shrink-0 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="eyebrow">Library</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setAutoPrepareEnabled((v) => !v)}
-                    title={
-                      health?.demucs
-                        ? "Automatically separate stems for the next 2 queued songs"
-                        : "Install Demucs locally to enable automatic stem separation"
-                    }
-                    className={`rounded-full border px-2 py-0.5 font-mono text-[10px] transition ${
-                      autoPrepareEnabled && health?.demucs
-                        ? "border-sky/35 bg-sky/10 text-sky"
-                        : "border-white/10 bg-white/[0.03] text-snow/45 hover:text-snow/75"
-                    }`}
-                  >
-                    Auto-Prep {autoPrepareEnabled ? "ON" : "OFF"}
-                  </button>
-                  <span className="font-mono text-[11px] text-snow/45">
-                    {health?.song_count ?? songs.length}
-                  </span>
-                </div>
-              </div>
-              <form onSubmit={handleAddAndScan} className="flex gap-1.5">
-                <input
-                  aria-label="Local music folder path"
-                  value={folderPath}
-                  onChange={(e) => setFolderPath(e.target.value)}
-                  placeholder="D:\Music"
-                  className="field py-1.5 text-xs"
-                />
-                <button
-                  type="submit"
-                  disabled={!health}
-                  className="btn-light shrink-0 px-3.5 py-1.5 text-[11px]"
+              Library
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sidebarTab === "party"}
+              onClick={() => setSidebarTab("party")}
+              className={`flex items-center justify-center gap-1.5 rounded-full py-1.5 text-xs font-semibold transition ${
+                sidebarTab === "party"
+                  ? "bg-white text-ink-950 shadow-sm"
+                  : "text-white/60 hover:text-white"
+              }`}
+            >
+              {stageRoom?.active && (
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              )}
+              <span>Party</span>
+              {stageRoom?.active && stageRoom.queueCount > 0 && (
+                <span
+                  className={`rounded-full px-1.5 py-0.2 text-[10px] ${
+                    sidebarTab === "party"
+                      ? "bg-ink-950/15 text-ink-950"
+                      : "bg-pink/25 text-pink"
+                  }`}
                 >
-                  Add & Scan
-                </button>
-              </form>
-              {statusMsg && (
-                <div className="flex items-center justify-between gap-2 rounded-md border border-sky/25 bg-sky/10 px-2.5 py-1.5">
-                  <p role="status" className="text-[11px] font-medium text-sky">
-                    {statusMsg}
-                  </p>
+                  {stageRoom.queueCount}
+                </span>
+              )}
+            </button>
+          </div>
+
+          {statusMsg && (
+            <div className="mb-2.5 flex shrink-0 items-center justify-between gap-2 rounded-xl border border-white/12 bg-white/[0.06] px-3 py-2">
+              <p role="status" className="text-[11px] font-medium text-white/85">
+                {statusMsg}
+              </p>
+              <button
+                type="button"
+                aria-label="Dismiss status message"
+                onClick={() => setStatusMsg(null)}
+                className="text-[10px] text-white/45 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Library Tab */}
+          <div className={`${sidebarTab === "library" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-2.5`}>
+            {/* Clean Live Search + Shuffle */}
+            <div className="flex shrink-0 items-center gap-1.5">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void refresh(query);
+                }}
+                className="relative min-w-0 flex-1"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  aria-hidden="true"
+                  className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-white/38"
+                >
+                  <circle cx="11" cy="11" r="8" />
+                  <path d="m21 21-4.3-4.3" />
+                </svg>
+                <input
+                  aria-label="Search indexed songs"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search songs, artists, albums..."
+                  className="field py-2 pl-9 pr-8 text-xs"
+                />
+                {query && (
                   <button
                     type="button"
-                    aria-label="Dismiss status message"
-                    onClick={() => setStatusMsg(null)}
-                    className="text-[10px] text-sky/70 hover:text-snow"
+                    aria-label="Clear search"
+                    onClick={() => setQuery("")}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-[10px] text-white/45 hover:text-white"
                   >
                     ✕
                   </button>
-                </div>
-              )}
+                )}
+              </form>
+
+              <button
+                type="button"
+                disabled={songs.length === 0}
+                onClick={() => void handleShufflePlay()}
+                aria-label="Shuffle play library"
+                title="Shuffle play your library (S)"
+                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition disabled:opacity-35 ${
+                  shuffleEnabled
+                    ? "border-pink/40 bg-pink/15 text-pink"
+                    : "border-white/12 bg-white/[0.05] text-white/70 hover:bg-white/10 hover:text-white"
+                }`}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22" />
+                  <path d="m18 2 4 4-4 4" />
+                  <path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2" />
+                  <path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8" />
+                  <path d="m18 14 4 4-4 4" />
+                </svg>
+              </button>
             </div>
 
-            {/* Flexible Scrollable Tracklist with real album thumbnails */}
-            <div className="thin-scroll min-h-[160px] flex-1 overflow-y-auto pr-1">
+            {/* Full-Height Spacious Tracklist */}
+            <div className="thin-scroll min-h-[200px] flex-1 overflow-y-auto pr-0.5">
               {songs.length === 0 ? (
-                <div className="flex h-full min-h-[140px] flex-col items-center justify-center rounded-xl border border-dashed border-white/10 px-4 py-8 text-center">
-                  <p className="text-xs font-medium text-snow/60">No tracks indexed yet</p>
-                  <p className="mt-1 text-[11px] text-snow/35">
-                    Enter your music folder (e.g. D:\Music) above and click Add & Scan.
+                <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center">
+                  <p className="text-xs font-semibold text-white/75">
+                    {query ? "No matching songs" : "Add your music folder"}
                   </p>
+                  {!query && (
+                    <form onSubmit={handleAddAndScan} className="w-full space-y-2">
+                      <input
+                        aria-label="Local music folder path"
+                        value={folderPath}
+                        onChange={(e) => setFolderPath(e.target.value)}
+                        placeholder="D:\Music"
+                        className="field py-1.5 text-center text-xs"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!health}
+                        className="btn-light w-full py-2 text-xs"
+                      >
+                        Add & Scan
+                      </button>
+                    </form>
+                  )}
                 </div>
               ) : (
-                <ul className="space-y-1">
+                <ul className="space-y-0.5">
                   {songs.map((song) => {
                     const isActive = activeSong?.id === song.id;
                     const cleanTitle = displayTitle(song.title);
-                    const subLabel = [song.artist, song.album].filter(Boolean).join(" · ") || song.title;
+                    const subLabel = song.artist || song.album || "";
                     return (
                       <li
                         key={song.id}
-                        className={`track-row group flex items-center justify-between gap-2 rounded-xl p-1.5 transition ${
-                          isActive
-                            ? "border border-white/14 bg-white/10"
-                            : "border border-transparent hover:bg-white/[0.04]"
+                        className={`track-row group flex items-center justify-between gap-2 rounded-xl px-2 py-1.5 transition ${
+                          isActive ? "bg-white/[0.11]" : "hover:bg-white/[0.05]"
                         }`}
                       >
                         <button
@@ -573,45 +831,45 @@ export function HostPage() {
                             className="rounded-lg shadow-sm"
                           />
                           <div className="min-w-0 flex-1">
-                            <p className="truncate text-xs font-semibold text-snow">
+                            <p
+                              className={`truncate text-[13px] font-medium ${
+                                isActive ? "text-white font-semibold" : "text-white/90"
+                              }`}
+                            >
                               {cleanTitle}
                             </p>
-                            <div className="mt-0.5 flex items-center gap-1.5">
-                              <p className="truncate text-[11px] text-snow/45">{subLabel}</p>
-                              {song.has_lyrics && (
-                                <span className="shrink-0 rounded bg-white/8 px-1 py-[1px] font-mono text-[9px] text-snow/65">
-                                  LRC
-                                </span>
-                              )}
-                              {song.has_instrumental && (
-                                <span className="shrink-0 rounded bg-sky/15 px-1 py-[1px] font-mono text-[9px] text-sky">
-                                  INST
-                                </span>
-                              )}
-                            </div>
+                            {subLabel && (
+                              <p className="truncate text-[11px] text-white/45">{subLabel}</p>
+                            )}
                           </div>
                         </button>
 
                         <div className="flex shrink-0 items-center gap-1">
-                          {!song.has_instrumental && song.readiness !== "preparing" && (
-                            <button
-                              type="button"
-                              onClick={() => void handlePrepare(song.id)}
-                              className="rounded px-1.5 py-1 font-mono text-[10px] text-snow/40 opacity-0 transition group-hover:opacity-100 hover:bg-white/10 hover:text-snow focus:opacity-100"
+                          {song.has_instrumental && (
+                            <span
+                              title="Instrumental ready"
+                              className="flex h-5 w-5 items-center justify-center rounded-full text-white/45"
                             >
-                              Prep
-                            </button>
+                              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+                                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                              </svg>
+                            </span>
                           )}
                           <button
                             type="button"
+                            aria-label="Play"
+                            title={isActive ? "Now Playing" : `Play ${cleanTitle}`}
                             onClick={() => selectSongForPlayback(song)}
-                            className={
+                            className={`flex h-7 w-7 items-center justify-center rounded-full transition ${
                               isActive
-                                ? "btn-primary px-2.5 py-1 text-[10px]"
-                                : "btn-ghost px-2.5 py-1 text-[10px]"
-                            }
+                                ? "bg-white text-ink-950 shadow-sm"
+                                : "text-white/50 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-white/12 hover:text-white"
+                            }`}
                           >
-                            Play
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                              <polygon points="7,4 20,12 7,20" />
+                            </svg>
                           </button>
                         </div>
                       </li>
@@ -629,17 +887,19 @@ export function HostPage() {
                 </button>
               )}
             </div>
+          </div>
 
-            {/* Docked Party Room Panel */}
-            <div className="shrink-0">
-              <HostRoomPanel
-                hostConnected={Boolean(health)}
-                onPlayHostSong={handlePlayHostSong}
-                playbackSignal={playbackSignal}
-                onStageRoomChange={setStageRoom}
-                onReactionBurst={handleReactionBurst}
-              />
-            </div>
+          {/* Party Room Tab (kept mounted so LAN/Cloud sync never disconnects when browsing Library) */}
+          <div className={`${sidebarTab === "party" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
+            <HostRoomPanel
+              hostConnected={Boolean(health)}
+              onPlayHostSong={handlePlayHostSong}
+              playbackSignal={playbackSignal}
+              activeLyrics={activeLyrics}
+              getPlaybackClock={getPlaybackClock}
+              onStageRoomChange={setStageRoom}
+              onReactionBurst={handleReactionBurst}
+            />
           </div>
         </aside>
 
@@ -648,45 +908,45 @@ export function HostPage() {
           aria-label="Karaoke Stage"
           className="relative flex min-h-0 flex-1 flex-col justify-center overflow-y-auto px-6 py-8 sm:px-10 lg:overflow-hidden lg:px-14"
         >
-          {/* Real Artwork-Driven Blurred Atmospheric Backdrop */}
+          {/* Flowing GPU-Composited Album-Adapted Backdrop */}
           <StageBackdrop
             songId={activeSong?.id}
             hasCover={activeSong?.has_cover}
             title={activeSong?.title}
+            playing={!activeSong || isPlaying}
           />
 
-          {/* Discreet Top-Right Floating Controls in Full-Screen TV Stage Mode */}
+          {/* Ultra-Discreet Apple Music–style Top-Right Controls in Full-Screen TV Stage Mode */}
           {tvMode && (
-            <div className="absolute right-5 top-5 z-30 flex items-center gap-2">
-              {stageRoom?.active && stageRoom.roomCode && (
-                <div className="hidden items-center gap-2 rounded-full border border-white/14 bg-black/30 px-3 py-1 backdrop-blur-md sm:flex">
-                  <span className="font-mono text-[11px] font-semibold tracking-wider text-white/90">
-                    {stageRoom.roomCode}
-                  </span>
-                  <SyncStatusBadge
-                    state={stageRoom.connState}
-                    transport={stageRoom.transport}
-                    compact
-                  />
-                </div>
+            <div className="absolute right-5 top-5 z-30 flex items-center gap-2 opacity-65 transition-opacity hover:opacity-100">
+              {stageRoom?.active && (
+                <button
+                  type="button"
+                  onClick={() => setShowTvOverlay((v) => !v)}
+                  aria-label={showTvOverlay ? "Hide TV overlay" : "Show TV overlay"}
+                  title={showTvOverlay ? "Hide QR Overlay (O)" : "Show QR Overlay (O)"}
+                  className={`flex h-9 w-9 items-center justify-center rounded-full border backdrop-blur-xl transition ${
+                    showTvOverlay
+                      ? "border-white/25 bg-black/35 text-white"
+                      : "border-white/12 bg-black/20 text-white/60 hover:bg-black/35 hover:text-white"
+                  }`}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                    <rect x="3" y="3" width="7" height="7" rx="1" />
+                    <rect x="14" y="3" width="7" height="7" rx="1" />
+                    <rect x="3" y="14" width="7" height="7" rx="1" />
+                    <path d="M14 14h3v3h-3zM19 14h2v2h-2zM14 19h2v2h-2zM19 19h2v2h-2z" />
+                  </svg>
+                </button>
               )}
-              <button
-                type="button"
-                onClick={() => setShowTvOverlay((v) => !v)}
-                aria-label={showTvOverlay ? "Hide TV overlay" : "Show TV overlay"}
-                title="Toggle Overlay (O)"
-                className="flex h-8 items-center justify-center rounded-full border border-white/15 bg-black/25 px-3 font-mono text-[10px] uppercase tracking-wider text-white/75 backdrop-blur-md transition hover:bg-white/15 hover:text-white"
-              >
-                {showTvOverlay ? "Overlay On" : "Overlay Off"}
-              </button>
               <button
                 type="button"
                 onClick={() => setTvMode(false)}
                 aria-label="Exit TV Stage Mode"
                 title="Exit TV Stage Mode (Esc / T)"
-                className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/25 text-white/75 backdrop-blur-md transition hover:bg-white/15 hover:text-white"
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/25 text-white/85 backdrop-blur-xl transition hover:bg-black/45 hover:text-white"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                   <path d="M18 6 6 18M6 6l12 12" />
                 </svg>
               </button>
@@ -811,6 +1071,25 @@ export function HostPage() {
                           <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
                         </svg>
                       )}
+                    </button>
+
+                    <button
+                      type="button"
+                      aria-label="Toggle shuffle"
+                      aria-pressed={shuffleEnabled}
+                      onClick={() => setShuffleEnabled((v) => !v)}
+                      className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
+                        shuffleEnabled ? "bg-white/22 text-white" : ""
+                      }`}
+                      title={shuffleEnabled ? "Shuffle On (S)" : "Shuffle Off (S)"}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22" />
+                        <path d="m18 2 4 4-4 4" />
+                        <path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2" />
+                        <path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8" />
+                        <path d="m18 14 4 4-4 4" />
+                      </svg>
                     </button>
 
                     <button
@@ -1084,6 +1363,7 @@ export function HostPage() {
                     if (audioRef.current && vocalAudioRef.current) {
                       vocalAudioRef.current.currentTime = audioRef.current.currentTime;
                     }
+                    emitPlayback(audioRef.current?.paused ? "paused" : "playing");
                   }}
                   onError={() => {
                     if (audioMode !== "original") {
@@ -1112,6 +1392,9 @@ export function HostPage() {
                     setIsPlaying(false);
                     emitPlayback("ended");
                     vocalAudioRef.current?.pause();
+                    if (!stageRoom?.playNext && shuffleEnabled) {
+                      void playNextShuffled(true);
+                    }
                   }}
                   className="sr-only"
                 />
@@ -1145,49 +1428,88 @@ export function HostPage() {
                   tvMode={tvMode}
                   editorOpen={lyricsEditorOpen}
                   onToggleEditor={() => setLyricsEditorOpen((v) => !v)}
+                  onLyricsSynced={(syncedSongId) => {
+                    setSongs((prev) =>
+                      prev.map((s) => (s.id === syncedSongId ? { ...s, has_lyrics: true } : s))
+                    );
+                    setActiveSong((prev) =>
+                      prev && prev.id === syncedSongId ? { ...prev, has_lyrics: true } : prev
+                    );
+                  }}
+                  onLyricsChange={(data) => {
+                    setActiveLyrics({
+                      songId: data.songId,
+                      title: activeSong.title,
+                      artist: activeSong.artist,
+                      lrcText: data.lrcText,
+                      offsetMs: data.offsetMs,
+                    });
+                  }}
                 />
               </div>
             </div>
           ) : (
             /* Clean Real-Library Quick Launch Grid (No Placeholders) */
             <div className="relative z-10 mx-auto w-full max-w-4xl space-y-6">
-              <div className="flex flex-wrap items-end justify-between gap-3">
-                <div>
-                  <p className="eyebrow text-sky">GeeT Stage</p>
-                  <h2 className="mt-1 text-2xl font-bold tracking-[-0.03em] text-snow sm:text-3xl">
-                    Pick a track to light up the stage
-                  </h2>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h2 className="text-2xl font-bold tracking-[-0.03em] text-white sm:text-3xl">
+                  Your Library
+                </h2>
+                <div className="flex items-center gap-2">
+                  {songs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => void handleShufflePlay()}
+                      className="btn-ghost px-4 py-2 text-xs font-semibold text-white"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22" />
+                        <path d="m18 2 4 4-4 4" />
+                        <path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2" />
+                        <path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8" />
+                        <path d="m18 14 4 4-4 4" />
+                      </svg>
+                      <span>Shuffle</span>
+                    </button>
+                  )}
+                  {stageRoom?.playNext && (
+                    <button
+                      type="button"
+                      onClick={stageRoom.playNext}
+                      className="btn-primary px-5 py-2 text-xs"
+                    >
+                      Play Up Next ({displayTitle(stageRoom.upNext[0]?.title ?? "Track")})
+                    </button>
+                  )}
                 </div>
-                {stageRoom?.playNext && (
-                  <button
-                    type="button"
-                    onClick={stageRoom.playNext}
-                    className="btn-primary px-5 py-2 text-xs"
-                  >
-                    Play Up Next ({displayTitle(stageRoom.upNext[0]?.title ?? "Track")})
-                  </button>
-                )}
               </div>
 
               {songs.length > 0 ? (
-                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4">
+                <div className="grid grid-cols-2 gap-5 sm:grid-cols-3 md:grid-cols-4">
                   {songs.slice(0, 8).map((song) => (
                     <button
                       key={song.id}
                       type="button"
                       onClick={() => selectSongForPlayback(song)}
-                      className="group rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-left transition hover:-translate-y-0.5 hover:border-white/25 hover:bg-white/[0.07]"
+                      className="group rounded-2xl p-2 text-left transition hover:bg-white/[0.06]"
                     >
-                      <Cover
-                        title={song.title}
-                        songId={song.id}
-                        hasCover={song.has_cover !== false}
-                        className="aspect-square w-full rounded-xl shadow-lg transition duration-300 group-hover:scale-[1.02]"
-                      />
-                      <p className="mt-2.5 truncate text-xs font-semibold text-snow">
+                      <div className="relative overflow-hidden rounded-xl shadow-[0_12px_32px_rgba(0,0,0,0.45)]">
+                        <Cover
+                          title={song.title}
+                          songId={song.id}
+                          hasCover={song.has_cover !== false}
+                          className="aspect-square w-full transition duration-300 group-hover:scale-[1.03]"
+                        />
+                        <span className="absolute bottom-2.5 right-2.5 flex h-9 w-9 items-center justify-center rounded-full bg-black/55 text-white opacity-0 shadow-lg backdrop-blur-md transition duration-200 group-hover:opacity-100">
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                            <polygon points="7,4 20,12 7,20" />
+                          </svg>
+                        </span>
+                      </div>
+                      <p className="mt-2.5 truncate text-[13px] font-semibold text-snow">
                         {displayTitle(song.title)}
                       </p>
-                      <p className="truncate text-[11px] text-snow/50">
+                      <p className="truncate text-xs text-snow/50">
                         {[song.artist, song.album].filter(Boolean).join(" — ") || formatSec(song.duration_ms / 1000)}
                       </p>
                     </button>
