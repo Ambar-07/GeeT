@@ -75,6 +75,7 @@ export function HostPage() {
   const [folderPath, setFolderPath] = useState("");
   const [query, setQuery] = useState("");
   const [songs, setSongs] = useState<HostSong[]>([]);
+  const [featuredSongs, setFeaturedSongs] = useState<HostSong[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [activeSong, setActiveSong] = useState<HostSong | null>(null);
   const [audioMode, setAudioMode] = useState<AudioMode>("original");
@@ -107,10 +108,12 @@ export function HostPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const vocalAudioRef = useRef<HTMLAudioElement | null>(null);
   const resumePosRef = useRef<number | null>(null);
+  const shouldAutoPlayRef = useRef(false);
   const songsRef = useRef<HostSong[]>([]);
   const shufflePoolRef = useRef<HostSong[]>([]);
   const shuffleBagRef = useRef<HostSong[]>([]);
   const shuffleHistoryRef = useRef<HostSong[]>([]);
+  const featuredHoveredRef = useRef(false);
   const autoPreparedIdsRef = useRef<Set<string>>(new Set());
   songsRef.current = songs;
 
@@ -316,14 +319,40 @@ export function HostPage() {
     };
   }, [autoPrepareEnabled, health?.demucs, stageRoom?.upNext, songsById, activeJob]);
 
+  function startAudioElement(songId: string, mode: AudioMode, seekSec?: number) {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const nextUrl = mediaUrl(songId, mode);
+    if (audio.src !== nextUrl) {
+      audio.src = nextUrl;
+      audio.load();
+    }
+    if (seekSec !== undefined && Number.isFinite(seekSec)) {
+      resumePosRef.current = seekSec;
+    }
+    audio.volume = volume;
+    audio.muted = muted;
+    // Call play() synchronously inside the user's click/tap gesture so browsers unlock autoplay immediately
+    void audio.play().catch(() => {});
+  }
+
   function selectSongForPlayback(song: HostSong) {
+    shouldAutoPlayRef.current = true;
+    const nextMode: AudioMode = song.has_instrumental ? "instrumental" : "original";
+    if (activeSongRef.current?.id === song.id && audioRef.current) {
+      if (audioRef.current.paused) {
+        void audioRef.current.play().catch(() => {});
+      }
+      return;
+    }
     resumePosRef.current = null;
     setCurrentSec(0);
     setDurationSec(song.duration_ms ? song.duration_ms / 1000 : 0);
     setActiveSong(song);
-    setAudioMode(song.has_instrumental ? "instrumental" : "original");
+    setAudioMode(nextMode);
     setLyricsEditorOpen(false);
     setStemMenuOpen(false);
+    startAudioElement(song.id, nextMode, 0);
   }
 
   async function ensureShufflePool(): Promise<HostSong[]> {
@@ -344,16 +373,14 @@ export function HostPage() {
     }
   }
 
-  async function playNextShuffled(recordHistory = true) {
-    const pool = await ensureShufflePool();
+  function pickAndPlayFromPool(pool: HostSong[], recordHistory: boolean) {
     if (pool.length === 0) return;
-
     const currentId = activeSongRef.current?.id;
     if (shuffleBagRef.current.length === 0) {
-      const fresh = shuffleList(pool.filter((s) => pool.length === 1 || s.id !== currentId));
-      shuffleBagRef.current = fresh;
+      shuffleBagRef.current = shuffleList(
+        pool.filter((s) => pool.length === 1 || s.id !== currentId)
+      );
     }
-
     const next = shuffleBagRef.current.pop();
     if (!next) return;
     if (recordHistory && activeSongRef.current) {
@@ -362,10 +389,57 @@ export function HostPage() {
     selectSongForPlayback(next);
   }
 
-  async function handleShufflePlay() {
-    setShuffleEnabled(true);
-    await playNextShuffled(true);
+  async function playNextShuffled(recordHistory = true) {
+    if (shufflePoolRef.current.length > 0) {
+      pickAndPlayFromPool(shufflePoolRef.current, recordHistory);
+      return;
+    }
+    const pool = await ensureShufflePool();
+    pickAndPlayFromPool(pool, recordHistory);
   }
+
+  function handleShufflePlay() {
+    setShuffleEnabled(true);
+    if (shufflePoolRef.current.length > 0) {
+      pickAndPlayFromPool(shufflePoolRef.current, true);
+    } else if (songsRef.current.length > 0) {
+      // Start playing synchronously inside the user gesture while full pool loads in background
+      pickAndPlayFromPool(songsRef.current, true);
+      void ensureShufflePool();
+    } else {
+      void playNextShuffled(true);
+    }
+  }
+
+  const rotateFeaturedSongs = useCallback(async () => {
+    const pool = await ensureShufflePool();
+    const source = pool.length > 0 ? pool : songsRef.current;
+    if (source.length === 0) {
+      setFeaturedSongs([]);
+      return;
+    }
+    const withArt = source.filter((s) => s.has_cover !== false);
+    const base = withArt.length >= 8 ? withArt : source;
+    setFeaturedSongs((prev) => {
+      const prevIds = new Set(prev.map((s) => s.id));
+      const freshPool = base.filter((s) => !prevIds.has(s.id));
+      const candidates = freshPool.length >= 8 ? freshPool : base;
+      return shuffleList(candidates).slice(0, 8);
+    });
+  }, []);
+
+  // Dynamically rotate the 8 spotlight tracks across the whole library while on the idle screen
+  useEffect(() => {
+    if (activeSong || !health || health.song_count === 0) return;
+    void rotateFeaturedSongs();
+    if (health.song_count <= 8) return;
+    const timer = setInterval(() => {
+      if (!featuredHoveredRef.current) {
+        void rotateFeaturedSongs();
+      }
+    }, 12_000);
+    return () => clearInterval(timer);
+  }, [activeSong, health?.song_count, rotateFeaturedSongs]);
 
   function stepLibraryTrack(delta: -1 | 1) {
     if (!activeSong) return;
@@ -401,18 +475,24 @@ export function HostPage() {
   }
 
   function switchAudioMode(nextMode: AudioMode) {
-    if (audioRef.current) {
-      resumePosRef.current = audioRef.current.currentTime;
-    }
+    const curPos = audioRef.current?.currentTime ?? 0;
+    const wasPlaying = audioRef.current ? !audioRef.current.paused : true;
+    resumePosRef.current = curPos;
+    shouldAutoPlayRef.current = wasPlaying;
     setAudioMode(nextMode);
+    if (activeSongRef.current && wasPlaying) {
+      startAudioElement(activeSongRef.current.id, nextMode, curPos);
+    }
   }
 
   function togglePlayPause() {
     const audio = audioRef.current;
     if (!audio) return;
     if (audio.paused) {
+      shouldAutoPlayRef.current = true;
       void audio.play().catch(() => {});
     } else {
+      shouldAutoPlayRef.current = false;
       audio.pause();
     }
   }
@@ -1330,94 +1410,6 @@ export function HostPage() {
                     </div>
                   </div>
                 )}
-
-                <audio
-                  ref={audioRef}
-                  key={`${activeSong.id}-${audioMode}`}
-                  autoPlay
-                  src={mediaUrl(activeSong.id, audioMode)}
-                  onLoadedMetadata={() => {
-                    if (audioRef.current) {
-                      audioRef.current.volume = volume;
-                      audioRef.current.muted = muted;
-                      setDurationSec(audioRef.current.duration || 0);
-                      if (resumePosRef.current !== null) {
-                        audioRef.current.currentTime = resumePosRef.current;
-                        if (vocalAudioRef.current) {
-                          vocalAudioRef.current.currentTime = resumePosRef.current;
-                        }
-                        resumePosRef.current = null;
-                      }
-                    }
-                  }}
-                  onTimeUpdate={() => {
-                    const primary = audioRef.current;
-                    if (!primary) return;
-                    setCurrentSec(primary.currentTime);
-                    const voc = vocalAudioRef.current;
-                    if (voc && Math.abs(voc.currentTime - primary.currentTime) > 0.14) {
-                      voc.currentTime = primary.currentTime;
-                    }
-                  }}
-                  onSeeked={() => {
-                    if (audioRef.current && vocalAudioRef.current) {
-                      vocalAudioRef.current.currentTime = audioRef.current.currentTime;
-                    }
-                    emitPlayback(audioRef.current?.paused ? "paused" : "playing");
-                  }}
-                  onError={() => {
-                    if (audioMode !== "original") {
-                      setStatusMsg("Instrumental unavailable; playing original.");
-                      setAudioMode("original");
-                    } else {
-                      setStatusMsg(
-                        `Browser could not decode ${activeSong.codec || activeSong.format}. Try Microsoft Edge for ALAC/Dolby Audio or convert to MP3/FLAC.`
-                      );
-                    }
-                  }}
-                  onPlay={() => {
-                    setIsPlaying(true);
-                    emitPlayback("playing");
-                    if (vocalAudioRef.current && audioRef.current) {
-                      vocalAudioRef.current.currentTime = audioRef.current.currentTime;
-                      void vocalAudioRef.current.play().catch(() => {});
-                    }
-                  }}
-                  onPause={() => {
-                    setIsPlaying(false);
-                    emitPlayback("paused");
-                    vocalAudioRef.current?.pause();
-                  }}
-                  onEnded={() => {
-                    setIsPlaying(false);
-                    emitPlayback("ended");
-                    vocalAudioRef.current?.pause();
-                    if (!stageRoom?.playNext && shuffleEnabled) {
-                      void playNextShuffled(true);
-                    }
-                  }}
-                  className="sr-only"
-                />
-
-                {/* Companion synced vocal stem for live 0-100% guide-vocal mixing */}
-                {audioMode === "instrumental" && activeSong.has_instrumental && (
-                  <audio
-                    ref={vocalAudioRef}
-                    key={`${activeSong.id}-vocal-mix`}
-                    src={mediaUrl(activeSong.id, "vocal")}
-                    preload="auto"
-                    onLoadedMetadata={() => {
-                      const voc = vocalAudioRef.current;
-                      const primary = audioRef.current;
-                      if (!voc || !primary) return;
-                      voc.volume = Math.max(0, Math.min(1, vocalMix * volume));
-                      voc.muted = muted || vocalMix <= 0.001;
-                      voc.currentTime = primary.currentTime;
-                      if (!primary.paused) void voc.play().catch(() => {});
-                    }}
-                    className="sr-only"
-                  />
-                )}
               </div>
 
               {/* Right Spacious Lyrics Stage */}
@@ -1456,6 +1448,20 @@ export function HostPage() {
                   Your Library
                 </h2>
                 <div className="flex items-center gap-2">
+                  {songs.length > 8 && (
+                    <button
+                      type="button"
+                      onClick={() => void rotateFeaturedSongs()}
+                      aria-label="Show different songs"
+                      title="Show different songs"
+                      className="btn-ghost h-9 w-9 p-0 text-white/75 hover:text-white"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M21 12a9 9 0 1 1-2.64-6.36L21 8" />
+                        <path d="M21 3v5h-5" />
+                      </svg>
+                    </button>
+                  )}
                   {songs.length > 0 && (
                     <button
                       type="button"
@@ -1485,8 +1491,16 @@ export function HostPage() {
               </div>
 
               {songs.length > 0 ? (
-                <div className="grid grid-cols-2 gap-5 sm:grid-cols-3 md:grid-cols-4">
-                  {songs.slice(0, 8).map((song) => (
+                <div
+                  onMouseEnter={() => {
+                    featuredHoveredRef.current = true;
+                  }}
+                  onMouseLeave={() => {
+                    featuredHoveredRef.current = false;
+                  }}
+                  className="grid grid-cols-2 gap-5 sm:grid-cols-3 md:grid-cols-4"
+                >
+                  {(featuredSongs.length > 0 ? featuredSongs : songs.slice(0, 8)).map((song) => (
                     <button
                       key={song.id}
                       type="button"
@@ -1523,6 +1537,103 @@ export function HostPage() {
                 </div>
               )}
             </div>
+          )}
+
+          {/* Persistent audio elements stay mounted across idle/stage transitions so tap-to-play unlocks autoplay synchronously */}
+          <audio
+            ref={audioRef}
+            autoPlay
+            src={activeSong ? mediaUrl(activeSong.id, audioMode) : undefined}
+            onLoadedMetadata={() => {
+              if (audioRef.current) {
+                audioRef.current.volume = volume;
+                audioRef.current.muted = muted;
+                setDurationSec(audioRef.current.duration || 0);
+                if (resumePosRef.current !== null) {
+                  audioRef.current.currentTime = resumePosRef.current;
+                  if (vocalAudioRef.current) {
+                    vocalAudioRef.current.currentTime = resumePosRef.current;
+                  }
+                  resumePosRef.current = null;
+                }
+                if (shouldAutoPlayRef.current && audioRef.current.paused) {
+                  void audioRef.current.play().catch(() => {});
+                }
+              }
+            }}
+            onCanPlay={() => {
+              if (shouldAutoPlayRef.current && audioRef.current?.paused) {
+                void audioRef.current.play().catch(() => {});
+              }
+            }}
+            onTimeUpdate={() => {
+              const primary = audioRef.current;
+              if (!primary) return;
+              setCurrentSec(primary.currentTime);
+              const voc = vocalAudioRef.current;
+              if (voc && Math.abs(voc.currentTime - primary.currentTime) > 0.14) {
+                voc.currentTime = primary.currentTime;
+              }
+            }}
+            onSeeked={() => {
+              if (audioRef.current && vocalAudioRef.current) {
+                vocalAudioRef.current.currentTime = audioRef.current.currentTime;
+              }
+              emitPlayback(audioRef.current?.paused ? "paused" : "playing");
+            }}
+            onError={() => {
+              if (!activeSong) return;
+              if (audioMode !== "original") {
+                setStatusMsg("Instrumental unavailable; playing original.");
+                setAudioMode("original");
+              } else {
+                setStatusMsg(
+                  `Browser could not decode ${activeSong.codec || activeSong.format}. Try Microsoft Edge for ALAC/Dolby Audio or convert to MP3/FLAC.`
+                );
+              }
+            }}
+            onPlay={() => {
+              shouldAutoPlayRef.current = false;
+              setIsPlaying(true);
+              emitPlayback("playing");
+              if (vocalAudioRef.current && audioRef.current) {
+                vocalAudioRef.current.currentTime = audioRef.current.currentTime;
+                void vocalAudioRef.current.play().catch(() => {});
+              }
+            }}
+            onPause={() => {
+              setIsPlaying(false);
+              emitPlayback("paused");
+              vocalAudioRef.current?.pause();
+            }}
+            onEnded={() => {
+              setIsPlaying(false);
+              emitPlayback("ended");
+              vocalAudioRef.current?.pause();
+              if (!stageRoom?.playNext && shuffleEnabled) {
+                void playNextShuffled(true);
+              }
+            }}
+            className="sr-only"
+          />
+
+          {activeSong && audioMode === "instrumental" && activeSong.has_instrumental && (
+            <audio
+              ref={vocalAudioRef}
+              key={`${activeSong.id}-vocal-mix`}
+              src={mediaUrl(activeSong.id, "vocal")}
+              preload="auto"
+              onLoadedMetadata={() => {
+                const voc = vocalAudioRef.current;
+                const primary = audioRef.current;
+                if (!voc || !primary) return;
+                voc.volume = Math.max(0, Math.min(1, vocalMix * volume));
+                voc.muted = muted || vocalMix <= 0.001;
+                voc.currentTime = primary.currentTime;
+                if (!primary.paused) void voc.play().catch(() => {});
+              }}
+              className="sr-only"
+            />
           )}
         </main>
       </div>
