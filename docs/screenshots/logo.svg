@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="96" viewBox="0 0 320 96" fill="none">
+  <rect width="320" height="96" rx="22" fill="#07080C" />
+  <g transform="translate(56, 16) scale(0.64)">
+    <rect x="33" y="10" width="34" height="50" rx="17" fill="#FB1E53" />
+    <path
+      d="M21 44C21 60.5 34 73.5 50 73.5C66 73.5 79 60.5 79 44"
+      stroke="#FB1E53"
+      stroke-width="12"
+      stroke-linecap="round"
+    />
+    <path
+      d="M35.5 69.5L28.5 85.5C27.6 87.6 29.8 89.6 31.8 88.5L50 78.2L35.5 69.5Z"
+      fill="#FB1E53"
+    />
+  </g>
+  <text
+    x="134"
+    y="63"
+    fill="#FFFFFF"
+    font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+    font-size="46"
+    font-weight="800"
+    letter-spacing="-1.6"
+  >GeeT</text>
+</svg>

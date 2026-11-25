@@ -1,4 +1,8 @@
-# GeeT Karaoke Platform
+<p align="center">
+  <img src="docs/screenshots/logo.svg" alt="GeeT Karaoke" width="240" />
+</p>
+
+<h1 align="center">GeeT Karaoke Platform</h1>
 
 GeeT turns your local music library into an Apple Music Sing–inspired karaoke stage with zero recurring cloud cost:
 - **Frontend**: React 19, Vite, TypeScript, Tailwind CSS, and a 60 FPS WebGL fluid album-art shader
