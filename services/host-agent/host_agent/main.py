@@ -368,7 +368,7 @@ def create_app(
 
     run_separator: SeparatorFn = separator_fn or run_demucs_separation
     compute_device = detect_compute_device()
-    db_lock = threading.Lock()
+    db_lock = threading.RLock()
     transcode_locks_guard = threading.Lock()
     transcode_locks: dict[str, threading.Lock] = {}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="geet-sep")
@@ -389,7 +389,8 @@ def create_app(
             raise HTTPException(status_code=401, detail="Invalid or missing host token")
 
     def _approved_paths() -> list[Path]:
-        rows = conn.execute("SELECT path FROM approved_dirs").fetchall()
+        with db_lock:
+            rows = conn.execute("SELECT path FROM approved_dirs").fetchall()
         return [Path(r["path"]).resolve() for r in rows]
 
     @app.get("/health")
@@ -414,21 +415,25 @@ def create_app(
         target = Path(req.path).expanduser().resolve()
         if not target.exists() or not target.is_dir():
             raise HTTPException(status_code=400, detail="Directory does not exist")
-        conn.execute("INSERT OR IGNORE INTO approved_dirs (path) VALUES (?)", (str(target),))
-        conn.commit()
+        with db_lock:
+            conn.execute("INSERT OR IGNORE INTO approved_dirs (path) VALUES (?)", (str(target),))
+            conn.commit()
         return {"ok": True, "approved_dirs": len(_approved_paths())}
 
     @app.post("/library/scan", dependencies=[Depends(_require_host_token)])
     def scan_library():
         job_id = uuid.uuid4().hex[:12]
-        conn.execute("INSERT INTO jobs (id, kind, status, progress) VALUES (?, 'scan', 'running', 0)", (job_id,))
-        conn.commit()
-
         dirs = _approved_paths()
-        existing = {
-            r["id"]: (r["size_bytes"], r["mtime_ns"], r["file_path"])
-            for r in conn.execute("SELECT id, size_bytes, mtime_ns, file_path FROM songs").fetchall()
-        }
+        with db_lock:
+            conn.execute(
+                "INSERT INTO jobs (id, kind, status, progress) VALUES (?, 'scan', 'running', 0)",
+                (job_id,),
+            )
+            conn.commit()
+            existing = {
+                r["id"]: (r["size_bytes"], r["mtime_ns"], r["file_path"])
+                for r in conn.execute("SELECT id, size_bytes, mtime_ns, file_path FROM songs").fetchall()
+            }
 
         scanned = 0
         skipped_unchanged = 0
@@ -441,7 +446,11 @@ def create_app(
             if not d.exists():
                 continue
             for p in d.rglob("*"):
-                if conn.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()[0]:
+                with db_lock:
+                    cancel_row = conn.execute(
+                        "SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+                if cancel_row and cancel_row[0]:
                     cancelled = True
                     break
                 if not p.is_file():
@@ -473,69 +482,71 @@ def create_app(
                     except OSError:
                         has_sidecar_lrc = False
                 chash = _content_fingerprint(canonical, stat.st_size)
-                dup_row = conn.execute(
-                    "SELECT id FROM songs WHERE content_hash = ? AND id <> ? ORDER BY updated_at ASC LIMIT 1",
-                    (chash, sid),
-                ).fetchone()
-                dup_of = dup_row["id"] if dup_row else None
-                if dup_of:
-                    duplicates += 1
+                with db_lock:
+                    dup_row = conn.execute(
+                        "SELECT id FROM songs WHERE content_hash = ? AND id <> ? ORDER BY updated_at ASC LIMIT 1",
+                        (chash, sid),
+                    ).fetchone()
+                    dup_of = dup_row["id"] if dup_row else None
+                    if dup_of:
+                        duplicates += 1
 
-                conn.execute(
-                    """
-                    INSERT INTO songs (
-                        id, file_path, title, artist, album, duration_ms, format, codec,
-                        size_bytes, mtime_ns, content_hash, duplicate_of, has_lyrics, has_cover
+                    conn.execute(
+                        """
+                        INSERT INTO songs (
+                            id, file_path, title, artist, album, duration_ms, format, codec,
+                            size_bytes, mtime_ns, content_hash, duplicate_of, has_lyrics, has_cover
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            title = excluded.title,
+                            artist = excluded.artist,
+                            album = excluded.album,
+                            duration_ms = excluded.duration_ms,
+                            codec = excluded.codec,
+                            size_bytes = excluded.size_bytes,
+                            mtime_ns = excluded.mtime_ns,
+                            content_hash = excluded.content_hash,
+                            duplicate_of = excluded.duplicate_of,
+                            has_lyrics = CASE WHEN songs.has_lyrics = 1 THEN 1 ELSE excluded.has_lyrics END,
+                            has_cover = excluded.has_cover,
+                            updated_at = datetime('now')
+                        """,
+                        (
+                            sid,
+                            str(canonical),
+                            title,
+                            artist,
+                            album,
+                            duration_ms,
+                            ext.lstrip("."),
+                            codec,
+                            stat.st_size,
+                            stat.st_mtime_ns,
+                            chash,
+                            dup_of,
+                            int(has_sidecar_lrc),
+                            int(has_cover),
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        title = excluded.title,
-                        artist = excluded.artist,
-                        album = excluded.album,
-                        duration_ms = excluded.duration_ms,
-                        codec = excluded.codec,
-                        size_bytes = excluded.size_bytes,
-                        mtime_ns = excluded.mtime_ns,
-                        content_hash = excluded.content_hash,
-                        duplicate_of = excluded.duplicate_of,
-                        has_lyrics = CASE WHEN songs.has_lyrics = 1 THEN 1 ELSE excluded.has_lyrics END,
-                        has_cover = excluded.has_cover,
-                        updated_at = datetime('now')
-                    """,
-                    (
-                        sid,
-                        str(canonical),
-                        title,
-                        artist,
-                        album,
-                        duration_ms,
-                        ext.lstrip("."),
-                        codec,
-                        stat.st_size,
-                        stat.st_mtime_ns,
-                        chash,
-                        dup_of,
-                        int(has_sidecar_lrc),
-                        int(has_cover),
-                    ),
-                )
                 scanned += 1
             if cancelled:
                 break
 
         removed = 0
-        if not cancelled:
-            for sid in set(existing.keys()) - seen_ids:
-                conn.execute("DELETE FROM songs WHERE id = ?", (sid,))
-                removed += 1
-
         final_status = "cancelled" if cancelled else "completed"
-        detail = f"scanned={scanned} unchanged={skipped_unchanged} removed={removed} drm={rejected_drm} dup={duplicates}"
-        conn.execute(
-            "UPDATE jobs SET status = ?, progress = 100, detail = ?, updated_at = datetime('now') WHERE id = ?",
-            (final_status, detail, job_id),
-        )
-        conn.commit()
+        with db_lock:
+            if not cancelled:
+                for sid in set(existing.keys()) - seen_ids:
+                    conn.execute("DELETE FROM songs WHERE id = ?", (sid,))
+                    removed += 1
+
+            detail = f"scanned={scanned} unchanged={skipped_unchanged} removed={removed} drm={rejected_drm} dup={duplicates}"
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = 100, detail = ?, updated_at = datetime('now') WHERE id = ?",
+                (final_status, detail, job_id),
+            )
+            conn.commit()
         return {
             "job_id": job_id,
             "status": final_status,
@@ -561,18 +572,19 @@ def create_app(
             params.extend([c_title, c_title, c_id])
 
         params.append(limit + 1)
-        rows = conn.execute(
-            f"""
-            SELECT id, title, artist, album, duration_ms, format, codec, readiness,
-                   has_lyrics, has_instrumental, has_cover, duplicate_of
-            FROM songs
-            WHERE (title LIKE ? OR artist LIKE ? OR COALESCE(album, '') LIKE ?)
-            {cursor_clause}
-            ORDER BY title ASC, id ASC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
+        with db_lock:
+            rows = conn.execute(
+                f"""
+                SELECT id, title, artist, album, duration_ms, format, codec, readiness,
+                       has_lyrics, has_instrumental, has_cover, duplicate_of
+                FROM songs
+                WHERE (title LIKE ? OR artist LIKE ? OR COALESCE(album, '') LIKE ?)
+                {cursor_clause}
+                ORDER BY title ASC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
 
         has_more = len(rows) > limit
         page_rows = rows[:limit]
@@ -581,14 +593,15 @@ def create_app(
 
     @app.get("/library/songs/{song_id}")
     def get_song(song_id: str):
-        row = conn.execute(
-            """
-            SELECT id, title, artist, album, duration_ms, format, codec, readiness,
-                   has_lyrics, has_instrumental, has_cover, duplicate_of
-            FROM songs WHERE id = ?
-            """,
-            (song_id,),
-        ).fetchone()
+        with db_lock:
+            row = conn.execute(
+                """
+                SELECT id, title, artist, album, duration_ms, format, codec, readiness,
+                       has_lyrics, has_instrumental, has_cover, duplicate_of
+                FROM songs WHERE id = ?
+                """,
+                (song_id,),
+            ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Song not found")
         return _song_row_to_dict(row)
@@ -810,36 +823,38 @@ def create_app(
 
     @app.get("/songs/{song_id}/lyrics")
     def get_lyrics(song_id: str):
-        song = conn.execute("SELECT id, file_path FROM songs WHERE id = ?", (song_id,)).fetchone()
-        if not song:
-            raise HTTPException(status_code=404, detail="Song not found")
+        with db_lock:
+            song = conn.execute("SELECT id, file_path FROM songs WHERE id = ?", (song_id,)).fetchone()
+            if not song:
+                raise HTTPException(status_code=404, detail="Song not found")
 
-        row = conn.execute(
-            "SELECT song_id, lrc_text, offset_ms, source, synchronized_ready FROM lyrics WHERE song_id = ?",
-            (song_id,),
-        ).fetchone()
-        if row:
-            return {
-                "song_id": row["song_id"],
-                "lrc_text": row["lrc_text"],
-                "offset_ms": row["offset_ms"],
-                "source": row["source"],
-                "synchronized_ready": bool(row["synchronized_ready"]),
-            }
+            row = conn.execute(
+                "SELECT song_id, lrc_text, offset_ms, source, synchronized_ready FROM lyrics WHERE song_id = ?",
+                (song_id,),
+            ).fetchone()
+            if row:
+                return {
+                    "song_id": row["song_id"],
+                    "lrc_text": row["lrc_text"],
+                    "offset_ms": row["offset_ms"],
+                    "source": row["source"],
+                    "synchronized_ready": bool(row["synchronized_ready"]),
+                }
 
         sidecar = Path(song["file_path"]).resolve().with_suffix(".lrc")
         if sidecar.is_file() and _is_within_approved(sidecar, _approved_paths()):
             text = sidecar.read_text(encoding="utf-8", errors="replace")
             sync_ready = _has_timed_lrc(text)
-            conn.execute(
-                """
-                INSERT INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready)
-                VALUES (?, ?, 0, 'sidecar', ?)
-                """,
-                (song_id, text, int(sync_ready)),
-            )
-            conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
-            conn.commit()
+            with db_lock:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready)
+                    VALUES (?, ?, 0, 'sidecar', ?)
+                    """,
+                    (song_id, text, int(sync_ready)),
+                )
+                conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
+                conn.commit()
             return {
                 "song_id": song_id,
                 "lrc_text": text,
@@ -869,25 +884,26 @@ def create_app(
 
     @app.put("/songs/{song_id}/lyrics", dependencies=[Depends(_require_host_token)])
     def put_lyrics(song_id: str, req: UpdateLyricsRequest):
-        if not conn.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
-            raise HTTPException(status_code=404, detail="Song not found")
         source = req.source if req.source in ("sidecar", "manual", "lrclib") else "manual"
         sync_ready = _has_timed_lrc(req.lrc_text)
-        conn.execute(
-            """
-            INSERT INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready, updated_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(song_id) DO UPDATE SET
-                lrc_text = excluded.lrc_text,
-                offset_ms = excluded.offset_ms,
-                source = excluded.source,
-                synchronized_ready = excluded.synchronized_ready,
-                updated_at = datetime('now')
-            """,
-            (song_id, req.lrc_text, req.offset_ms, source, int(sync_ready)),
-        )
-        conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
-        conn.commit()
+        with db_lock:
+            if not conn.execute("SELECT 1 FROM songs WHERE id = ?", (song_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="Song not found")
+            conn.execute(
+                """
+                INSERT INTO lyrics (song_id, lrc_text, offset_ms, source, synchronized_ready, updated_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(song_id) DO UPDATE SET
+                    lrc_text = excluded.lrc_text,
+                    offset_ms = excluded.offset_ms,
+                    source = excluded.source,
+                    synchronized_ready = excluded.synchronized_ready,
+                    updated_at = datetime('now')
+                """,
+                (song_id, req.lrc_text, req.offset_ms, source, int(sync_ready)),
+            )
+            conn.execute("UPDATE songs SET has_lyrics = ? WHERE id = ?", (int(sync_ready), song_id))
+            conn.commit()
         return {
             "song_id": song_id,
             "lrc_text": req.lrc_text,
@@ -898,9 +914,10 @@ def create_app(
 
     @app.post("/songs/{song_id}/lyrics/lookup", dependencies=[Depends(_require_host_token)])
     def lookup_lrclib(song_id: str):
-        song = conn.execute(
-            "SELECT title, artist, album, duration_ms FROM songs WHERE id = ?", (song_id,)
-        ).fetchone()
+        with db_lock:
+            song = conn.execute(
+                "SELECT title, artist, album, duration_ms FROM songs WHERE id = ?", (song_id,)
+            ).fetchone()
         if not song:
             raise HTTPException(status_code=404, detail="Song not found")
         if not song["title"] or not song["artist"]:

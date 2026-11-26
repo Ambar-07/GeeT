@@ -3,6 +3,7 @@ import {
   computeEffectiveTimeMs,
   findActiveLineIndex,
   getInterludeState,
+  getLineWords,
   hasDevanagari,
   parseLrc,
   transliterateDevanagari,
@@ -71,6 +72,21 @@ describe("lrc parser and lookup", () => {
     expect(midBreak?.kind).toBe("interlude");
     expect(midBreak?.anchorIndex).toBe(2);
     expect(midBreak?.litDots).toBeGreaterThanOrEqual(1);
+  });
+
+  it("parses enhanced LRC word tags and computes weighted word timings for standard LRC", () => {
+    const enhanced = "[00:56.00]<00:56.00>We <00:56.40>don't <00:56.90>have <00:57.30>to <00:57.60>rush";
+    const parsedEnhanced = parseLrc(enhanced, 60_000);
+    expect(parsedEnhanced[0].text).toBe("We don't have to rush");
+    const eWords = getLineWords(parsedEnhanced[0]);
+    expect(eWords).toHaveLength(5);
+    expect(eWords[1]).toMatchObject({ text: "don't", startMs: 56_400, endMs: 56_900 });
+
+    const standard = parseLrc("[00:10.00]I feel it coming babe\n[00:14.00]Next", 20_000);
+    const sWords = getLineWords(standard[0]);
+    expect(sWords.map((w) => w.text)).toEqual(["I", "feel", "it", "coming", "babe"]);
+    expect(sWords[0].startMs).toBe(10_000);
+    expect(sWords[sWords.length - 1].endMs).toBeLessThanOrEqual(14_000);
   });
 });
 

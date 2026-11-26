@@ -13,49 +13,69 @@ export function HomePage() {
   }
 
   return (
-    <div className="stage-ambient min-h-screen text-snow">
-      <div className="mx-auto flex min-h-screen max-w-5xl flex-col px-6 py-8 sm:px-10">
-        <header className="flex items-center justify-between">
-          <Link to="/">
-            <Logo size={28} />
+    <div className="home-shell relative flex min-h-dvh flex-col overflow-hidden text-snow">
+      {/* Soft ambient stage glow */}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
+        <div
+          className="aura-blob aura-blob-a left-1/2 top-[38%] h-[520px] w-[520px] -translate-x-1/2 -translate-y-1/2 rounded-full opacity-25 blur-[130px]"
+          style={{ background: "radial-gradient(circle, #fa2d48 0%, transparent 70%)" }}
+        />
+        <div
+          className="aura-blob aura-blob-b left-[58%] top-[56%] h-[420px] w-[420px] -translate-x-1/2 -translate-y-1/2 rounded-full opacity-20 blur-[120px]"
+          style={{ background: "radial-gradient(circle, #4f46e5 0%, transparent 72%)" }}
+        />
+      </div>
+
+      <div className="relative z-10 mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-6 sm:px-10">
+        <header className="flex items-center justify-between py-6">
+          <Link to="/" aria-label="GeeT home">
+            <Logo size={30} />
           </Link>
           <Link to="/host" className="btn-ghost px-4 py-2 text-xs">
             Open Stage
           </Link>
         </header>
 
-        <main className="my-auto py-16">
-          <div className="max-w-xl space-y-6">
-            <h1 className="text-4xl font-bold leading-[1.08] tracking-[-0.035em] text-white sm:text-6xl">
-              GeeT Karaoke.
-              <br />
-              <span className="text-white/55">Your music, on the big screen.</span>
-            </h1>
-            <p className="max-w-md text-sm leading-relaxed text-white/55 sm:text-base">
-              Live synced lyrics, instant instrumentals, and a phone QR queue for the whole room.
-            </p>
+        <main className="my-auto flex flex-col items-center py-16 text-center">
+          <h1 className="max-w-3xl text-[clamp(2.75rem,6.5vw,5rem)] font-bold leading-[1.03] tracking-[-0.045em] text-white">
+            <span className="sr-only">GeeT Karaoke — </span>
+            Sing your library.
+          </h1>
 
-            <div className="flex flex-col gap-3 pt-2 sm:flex-row">
-              <form
-                onSubmit={handleJoin}
-                className="flex flex-1 items-center rounded-full border border-white/14 bg-white/[0.06] p-1.5 pl-4 backdrop-blur-xl transition focus-within:border-white/30 focus-within:bg-white/[0.09]"
+          <p className="mt-5 max-w-md text-[15px] leading-relaxed text-white/55 sm:text-base">
+            Synced lyrics, live vocals, and instant party rooms.
+          </p>
+
+          <div className="mt-9 flex w-full max-w-md flex-col items-stretch justify-center gap-3 sm:max-w-lg sm:flex-row sm:items-center">
+            <Link to="/host" className="btn-primary shrink-0 px-7 py-3 text-sm">
+              Host a Party
+            </Link>
+
+            <form
+              onSubmit={handleJoin}
+              className="flex min-w-0 flex-1 items-center rounded-full border border-white/12 bg-white/[0.05] p-1 pl-4 backdrop-blur-xl transition focus-within:border-white/30 focus-within:bg-white/[0.08]"
+            >
+              <input
+                id="room-code"
+                aria-label="Room code"
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/[^a-zA-Z0-9]/g, ""))}
+                placeholder="Room code"
+                maxLength={8}
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+                className="min-w-0 flex-1 bg-transparent text-xs font-medium uppercase tracking-[0.16em] text-white outline-none placeholder:normal-case placeholder:tracking-normal placeholder:text-white/40"
+                required
+              />
+              <button
+                type="submit"
+                disabled={!code.trim()}
+                className="btn-light ml-2 min-h-[34px] shrink-0 px-5 py-1.5 text-xs"
               >
-                <input
-                  aria-label="Room code"
-                  value={code}
-                  onChange={(e) => setCode(e.target.value)}
-                  placeholder="Room code"
-                  className="min-w-0 flex-1 bg-transparent text-xs font-medium uppercase tracking-wider text-white placeholder:normal-case placeholder:tracking-normal placeholder:text-white/40 outline-none"
-                />
-                <button type="submit" className="btn-light ml-2 px-4 py-1.5 text-xs">
-                  Join
-                </button>
-              </form>
-
-              <Link to="/host" className="btn-primary shrink-0 px-7 py-3 text-xs">
-                Host a Party
-              </Link>
-            </div>
+                Join
+              </button>
+            </form>
           </div>
         </main>
       </div>

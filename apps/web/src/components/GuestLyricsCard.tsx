@@ -3,6 +3,7 @@ import {
   computeEffectiveTimeMs,
   findActiveLineIndex,
   getInterludeState,
+  getLineWords,
   hasDevanagari,
   isInstrumentalLine,
   parseLrc,
@@ -91,6 +92,11 @@ export function GuestLyricsCard({
     [lrcText, durationMs]
   );
 
+  const lineWordsMap = useMemo(
+    () => lines.map((line) => (isInstrumentalLine(line.text) ? [] : getLineWords(line))),
+    [lines]
+  );
+
   const plainLines = useMemo(() => {
     if (lines.length > 0 || !lrcText.trim()) return [];
     return lrcText
@@ -125,7 +131,7 @@ export function GuestLyricsCard({
     });
   }
 
-  // Smooth interpolated clock driven by host playback checkpoint
+  // Smooth interpolated 60 FPS word glow + critically-damped glide driven by host checkpoint
   useEffect(() => {
     if (lines.length === 0) {
       setActiveIdx(-1);
@@ -133,11 +139,19 @@ export function GuestLyricsCard({
       return;
     }
 
-    let rafId = 0;
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
-    const syncOnce = () => {
+    let rafId = 0;
+    let lastTs = performance.now();
+
+    const syncFrame = (now: number) => {
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastTs) / 1000));
+      lastTs = now;
+
       const elapsedMs =
-        playbackStatus === "playing" ? Math.max(0, performance.now() - anchorLocalMs) : 0;
+        playbackStatus === "playing" ? Math.max(0, now - anchorLocalMs) : 0;
       const estimatedSec = (anchorPositionMs + elapsedMs) / 1000;
       const effMs = computeEffectiveTimeMs(estimatedSec, offsetMs);
       const nextIdx = findActiveLineIndex(lines, effMs);
@@ -157,10 +171,52 @@ export function GuestLyricsCard({
         }
         return nextInterlude;
       });
+
+      const lineEl = activeLineRef.current;
+      if (lineEl && nextIdx >= 0 && !isInstrumentalLine(lines[nextIdx].text)) {
+        const words = lineWordsMap[nextIdx];
+        if (words && words.length > 0) {
+          const wordEls = lineEl.querySelectorAll<HTMLElement>("[data-word-idx]");
+          for (let i = 0; i < wordEls.length && i < words.length; i++) {
+            const w = words[i];
+            const el = wordEls[i];
+            const span = Math.max(60, w.endMs - w.startMs);
+            if (effMs < w.startMs) {
+              el.style.setProperty("--wf", "0%");
+              if (el.dataset.state !== "upcoming") el.dataset.state = "upcoming";
+            } else if (effMs >= w.endMs) {
+              el.style.setProperty("--wf", "100%");
+              if (el.dataset.state !== "past") el.dataset.state = "past";
+            } else {
+              const pct = ((effMs - w.startMs) / span) * 100;
+              el.style.setProperty("--wf", `${pct.toFixed(1)}%`);
+              if (el.dataset.state !== "singing") el.dataset.state = "singing";
+            }
+          }
+        }
+      }
+
+      const container = scrollerRef.current;
+      const targetEl =
+        nextInterlude && nextInterlude.kind === "interlude" && interludeRef.current
+          ? interludeRef.current
+          : activeLineRef.current;
+      if (container && targetEl) {
+        const targetTop = Math.max(
+          0,
+          targetEl.offsetTop - container.clientHeight * 0.35 + targetEl.clientHeight / 2
+        );
+        const diff = targetTop - container.scrollTop;
+        if (reducedMotion || Math.abs(diff) < 0.6) {
+          if (Math.abs(diff) >= 0.5) container.scrollTop = targetTop;
+        } else {
+          container.scrollTop += diff * (1 - Math.exp(-7.2 * dt));
+        }
+      }
     };
 
-    const tick = () => {
-      syncOnce();
+    const tick = (now: number) => {
+      syncFrame(now);
       if (playbackStatus === "playing") {
         rafId = requestAnimationFrame(tick);
       } else {
@@ -168,7 +224,7 @@ export function GuestLyricsCard({
       }
     };
 
-    syncOnce();
+    syncFrame(performance.now());
     if (playbackStatus === "playing") {
       rafId = requestAnimationFrame(tick);
     }
@@ -176,19 +232,7 @@ export function GuestLyricsCard({
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [lines, offsetMs, playbackStatus, anchorPositionMs, anchorLocalMs]);
-
-  // Smooth auto-scroll to active line or active mid-song interlude
-  useEffect(() => {
-    const container = scrollerRef.current;
-    const targetEl =
-      interlude && interlude.kind === "interlude" && interludeRef.current
-        ? interludeRef.current
-        : activeLineRef.current;
-    if (!container || !targetEl) return;
-    const targetTop = targetEl.offsetTop - container.clientHeight * 0.36 + targetEl.clientHeight / 2;
-    container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
-  }, [activeIdx, interlude?.kind, interlude?.anchorIndex, fullscreen]);
+  }, [lines, lineWordsMap, offsetMs, playbackStatus, anchorPositionMs, anchorLocalMs, fullscreen]);
 
   // Close full-screen view with Escape
   useEffect(() => {
@@ -236,30 +280,41 @@ export function GuestLyricsCard({
                 interlude?.kind === "interlude" && interlude.anchorIndex === i;
               const isActive = i === activeIdx && !showTrailingInterlude;
               const isPast = activeIdx >= 0 && (i < activeIdx || showTrailingInterlude);
+              const dist = activeIdx >= 0 ? i - activeIdx : i;
+              const depthStyle: React.CSSProperties = isActive
+                ? { transform: "scale(1)", opacity: 1, filter: "none" }
+                : isPast
+                  ? { transform: "scale(0.965)", opacity: 0.26, filter: "blur(0.5px)" }
+                  : dist === 1
+                    ? { transform: "scale(0.975)", opacity: 0.48, filter: "none" }
+                    : { transform: "scale(0.955)", opacity: 0.28, filter: "blur(0.6px)" };
               const romanLine = romanizedSyncLines?.[i];
+              const words = lineWordsMap[i];
 
               return (
                 <div key={`${line.startMs}-${i}`} className="space-y-3">
                   <div
                     ref={isActive ? activeLineRef : undefined}
-                    className={`transition-colors duration-200 ${fullscreen ? "text-2xl sm:text-3xl leading-[1.3]" : "text-lg leading-[1.32]"
-                      } ${isActive
-                        ? "font-bold text-white"
-                        : isPast
-                          ? "font-semibold text-white/30"
-                          : "font-semibold text-white/48"
-                      }`}
+                    style={depthStyle}
+                    className={`lyric-line ${fullscreen ? "text-2xl sm:text-3xl leading-[1.3]" : "text-lg leading-[1.32]"
+                      } ${isActive ? "font-bold text-white" : "font-semibold text-white"}`}
                   >
-                    <p>{line.text}</p>
+                    <p>
+                      {isActive && words && words.length > 0
+                        ? words.map((w, wIdx) => (
+                            <span key={wIdx}>
+                              <span data-word-idx={wIdx} data-state="upcoming" className="lyric-word">
+                                {w.text}
+                              </span>
+                              {w.trailingSpace}
+                            </span>
+                          ))
+                        : line.text}
+                    </p>
                     {romanLine && romanLine !== line.text && (
                       <p
                         className={`mt-1 font-medium ${fullscreen ? "text-base sm:text-lg" : "text-xs sm:text-sm"
-                          } ${isActive
-                            ? "text-white/85"
-                            : isPast
-                              ? "text-white/22"
-                              : "text-white/36"
-                          }`}
+                          } ${isActive ? "text-white/85" : "text-white/55"}`}
                       >
                         {romanLine}
                       </p>

@@ -295,10 +295,24 @@ export function FluidCoverCanvas({
     let rafId = 0;
     let simTime = 0;
     let lastTs = performance.now();
+    let contextLost = false;
+
+    const handleContextLost = (e: Event) => {
+      e.preventDefault();
+      contextLost = true;
+      onFallback?.();
+    };
+    canvas.addEventListener("webglcontextlost", handleContextLost, false);
 
     const render = (now: number) => {
+      if (contextLost) return;
       const dt = Math.min(0.05, Math.max(0, (now - lastTs) / 1000));
       lastTs = now;
+
+      if (document.hidden) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
 
       if (!reducedMotion) {
         // Flows organically when playing; drifts gently at 28% speed when paused so it still feels alive
@@ -332,6 +346,7 @@ export function FluidCoverCanvas({
 
     return () => {
       cancelAnimationFrame(rafId);
+      canvas.removeEventListener("webglcontextlost", handleContextLost, false);
       glStateRef.current = null;
       gl.deleteTexture(texPrev);
       gl.deleteTexture(texCurr);

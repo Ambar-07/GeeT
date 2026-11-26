@@ -91,7 +91,29 @@ export function HostPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [lyricsEditorOpen, setLyricsEditorOpen] = useState(false);
   const [stemMenuOpen, setStemMenuOpen] = useState(false);
-  const [showVolumeSlider, setShowVolumeSlider] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const requestVersionRef = useRef(0);
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const settingsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!settingsRef.current?.contains(event.target as Node)) setSettingsOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [settingsOpen]);
 
   const [stageRoom, setStageRoom] = useState<HostStageRoomInfo | null>(null);
   const [reactionBursts, setReactionBursts] = useState<StageReactionBurst[]>([]);
@@ -102,6 +124,7 @@ export function HostPage() {
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [shuffleEnabled, setShuffleEnabled] = useState(false);
+  const [repeatOne, setRepeatOne] = useState(false);
   const [vocalMix, setVocalMix] = useState(0.15);
   const [showVocalSlider, setShowVocalSlider] = useState(false);
 
@@ -111,6 +134,7 @@ export function HostPage() {
   const shouldAutoPlayRef = useRef(false);
   const songsRef = useRef<HostSong[]>([]);
   const shufflePoolRef = useRef<HostSong[]>([]);
+  const shufflePoolPromiseRef = useRef<Promise<HostSong[]> | null>(null);
   const shuffleBagRef = useRef<HostSong[]>([]);
   const shuffleHistoryRef = useRef<HostSong[]>([]);
   const featuredHoveredRef = useRef(false);
@@ -176,31 +200,35 @@ export function HostPage() {
     return () => clearInterval(timer);
   }, [isPlaying, activeSong?.id, stageRoom?.active]);
 
-  async function refresh(searchQuery = query) {
+  async function refresh(searchQuery = queryRef.current) {
+    lastSearchQueryRef.current = searchQuery;
+    const version = ++requestVersionRef.current;
+    setLibraryLoading(true);
     try {
       const [h, page] = await Promise.all([fetchHostHealth(), fetchSongsPage(searchQuery)]);
+      if (version !== requestVersionRef.current || searchQuery !== queryRef.current) return;
       setHealth(h);
       setHealthError(null);
       setSongs(page.songs);
       setNextCursor(page.next_cursor);
     } catch (err) {
+      if (version !== requestVersionRef.current || searchQuery !== queryRef.current) return;
       setHealth(null);
       setHealthError(err instanceof Error ? err.message : "Host agent unreachable");
+    } finally {
+      if (version === requestVersionRef.current) setLibraryLoading(false);
     }
   }
 
-  const didMountQueryRef = useRef(false);
+  const lastSearchQueryRef = useRef("");
 
   useEffect(() => {
     void refresh("");
   }, []);
 
-  // Live debounced search as you type (no redundant Search button needed)
+  // Live debounced search as you type (StrictMode-safe: never schedules a stray refresh on mount)
   useEffect(() => {
-    if (!didMountQueryRef.current) {
-      didMountQueryRef.current = true;
-      return;
-    }
+    if (query === lastSearchQueryRef.current) return;
     const timer = setTimeout(() => {
       void refresh(query);
     }, 220);
@@ -219,11 +247,23 @@ export function HostPage() {
     }
   }, [volume, muted, vocalMix, activeSong, audioMode]);
 
+  // Keep a single owner for the media source. A declarative src prop would write
+  // it again after tap-to-play, restarting the resource and losing playback intent.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !activeSong) return;
+    const source = mediaUrl(activeSong.id, audioMode);
+    if (audio.getAttribute("src") !== source) {
+      audio.src = source;
+      audio.load();
+    }
+  }, [activeSong?.id, audioMode]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const target = e.target as HTMLElement | null;
+      if (e.ctrlKey || e.metaKey || e.altKey || target?.closest("input, textarea, select, button, a, [contenteditable='true'], [role='tab']")) return;
       if (e.code === "Space" && activeSong) {
         e.preventDefault();
         togglePlayPause();
@@ -237,6 +277,8 @@ export function HostPage() {
         setMuted((v) => !v);
       } else if (e.key === "s" || e.key === "S") {
         setShuffleEnabled((v) => !v);
+      } else if (e.key === "r" || e.key === "R") {
+        setRepeatOne((v) => !v);
       } else if (e.key === "ArrowRight" && audioRef.current) {
         e.preventDefault();
         audioRef.current.currentTime = Math.min(
@@ -273,10 +315,10 @@ export function HostPage() {
             await refresh();
             if (activeSong && updated.song_id === activeSong.id) {
               const refreshed = await fetchSong(activeSong.id);
+              if (activeSongRef.current?.id !== refreshed.id) return;
               setActiveSong(refreshed);
               if (updated.status === "completed" && refreshed.has_instrumental) {
-                if (audioRef.current) resumePosRef.current = audioRef.current.currentTime;
-                setAudioMode("instrumental");
+                switchAudioMode("instrumental");
                 setShowVocalSlider(true);
               }
             }
@@ -337,6 +379,10 @@ export function HostPage() {
   }
 
   function selectSongForPlayback(song: HostSong) {
+    if (song.readiness === "drm_rejected") {
+      setStatusMsg("This track is DRM-protected and cannot be played.");
+      return;
+    }
     shouldAutoPlayRef.current = true;
     const nextMode: AudioMode = song.has_instrumental ? "instrumental" : "original";
     if (activeSongRef.current?.id === song.id && audioRef.current) {
@@ -353,24 +399,38 @@ export function HostPage() {
     setLyricsEditorOpen(false);
     setStemMenuOpen(false);
     startAudioElement(song.id, nextMode, 0);
+    if (window.innerWidth < 1024) {
+      requestAnimationFrame(() => document.getElementById("karaoke-stage")?.scrollIntoView({ behavior: "smooth" }));
+    }
   }
 
   async function ensureShufflePool(): Promise<HostSong[]> {
     if (shufflePoolRef.current.length > 0) return shufflePoolRef.current;
-    try {
-      const all: HostSong[] = [];
-      let cursor: string | null = null;
-      do {
-        const page = await fetchSongsPage("", cursor);
-        all.push(...page.songs);
-        cursor = page.next_cursor;
-      } while (cursor);
-      const playable = all.filter((s) => s.readiness !== "drm_rejected");
-      shufflePoolRef.current = playable;
-      return playable;
-    } catch {
-      return songsRef.current;
-    }
+    if (shufflePoolPromiseRef.current) return shufflePoolPromiseRef.current;
+    const promise = (async () => {
+      try {
+        const byId = new Map<string, HostSong>();
+        let cursor: string | null = null;
+        do {
+          const page = await fetchSongsPage("", cursor);
+          for (const song of page.songs) {
+            if (song.readiness !== "drm_rejected" && !byId.has(song.id)) {
+              byId.set(song.id, song);
+            }
+          }
+          cursor = page.next_cursor;
+        } while (cursor);
+        const playable = Array.from(byId.values());
+        shufflePoolRef.current = playable;
+        return playable;
+      } catch {
+        return songsRef.current;
+      } finally {
+        shufflePoolPromiseRef.current = null;
+      }
+    })();
+    shufflePoolPromiseRef.current = promise;
+    return promise;
   }
 
   function pickAndPlayFromPool(pool: HostSong[], recordHistory: boolean) {
@@ -518,9 +578,12 @@ export function HostPage() {
     try {
       await clearSongCache(songId);
       autoPreparedIdsRef.current.delete(songId);
-      if (activeSong?.id === songId) {
-        setAudioMode("original");
-        setActiveSong(await fetchSong(songId));
+      if (activeSongRef.current?.id === songId) {
+        const refreshed = await fetchSong(songId);
+        if (activeSongRef.current?.id === songId) {
+          switchAudioMode("original");
+          setActiveSong(refreshed);
+        }
       }
       await refresh();
       setStatusMsg("Instrumental cache cleared.");
@@ -531,7 +594,8 @@ export function HostPage() {
 
   async function handleAddAndScan(e: React.FormEvent) {
     e.preventDefault();
-    if (!folderPath.trim()) return;
+    if (!folderPath.trim() || scanning) return;
+    setScanning(true);
     setStatusMsg("Scanning folder...");
     try {
       await selectLibraryFolder(folderPath.trim());
@@ -542,14 +606,27 @@ export function HostPage() {
       await refresh();
     } catch (err) {
       setStatusMsg(err instanceof Error ? err.message : "Scan failed");
+    } finally {
+      setScanning(false);
     }
   }
 
   async function handleLoadMore() {
-    if (!nextCursor) return;
-    const page = await fetchSongsPage(query, nextCursor);
-    setSongs((prev) => [...prev, ...page.songs]);
-    setNextCursor(page.next_cursor);
+    if (!nextCursor || loadingMore || libraryLoading) return;
+    const version = requestVersionRef.current;
+    const searchQuery = query;
+    setLoadingMore(true);
+    try {
+      const page = await fetchSongsPage(searchQuery, nextCursor);
+      if (version !== requestVersionRef.current || searchQuery !== queryRef.current) return;
+      setSongs((prev) => [...prev, ...page.songs.filter((song) => !prev.some((existing) => existing.id === song.id))]);
+      setNextCursor(page.next_cursor);
+      setStatusMsg(null);
+    } catch (err) {
+      if (version === requestVersionRef.current) setStatusMsg(err instanceof Error ? err.message : "Could not load more songs. Try again.");
+    } finally {
+      setLoadingMore(false);
+    }
   }
 
   const remainingSec = Math.max(0, durationSec - currentSec);
@@ -584,12 +661,12 @@ export function HostPage() {
     : "";
 
   return (
-    <div className="flex min-h-screen flex-col bg-ink-950 text-snow lg:h-screen lg:overflow-hidden">
+    <div className={`host-shell flex min-h-dvh flex-col bg-ink-950 text-snow lg:h-dvh lg:overflow-hidden ${tvMode ? "is-tv" : ""}`}>
       {/* Minimalist Top Bar (hidden in TV Stage Mode so the stage goes truly full-bleed) */}
       {!tvMode && (
         <header className="relative z-30 flex shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] bg-ink-950/90 px-4 py-2.5 backdrop-blur-xl sm:px-5">
           <Link to="/" className="shrink-0">
-            <Logo size={25} />
+            <Logo size={30} suffix="Studio" />
           </Link>
 
           <div className="hidden items-center gap-2 text-xs sm:flex">
@@ -599,14 +676,14 @@ export function HostPage() {
                 Connected • {health.song_count} songs
               </span>
             ) : (
-              <span role="alert" className="text-pink">
-                {healthError ?? "Connecting..."}
+              <span role="status" title={healthError ?? undefined} className="text-rose-300">
+                {healthError ? "Host offline" : "Connecting…"}
               </span>
             )}
           </div>
 
           <div className="flex items-center gap-2 text-xs">
-            <div className="relative">
+            <div ref={settingsRef} className="relative">
               <button
                 type="button"
                 aria-label="Library & settings"
@@ -626,7 +703,7 @@ export function HostPage() {
               </button>
 
               {settingsOpen && (
-                <div className="absolute right-0 top-10 z-50 w-80 space-y-3.5 rounded-2xl border border-white/14 bg-ink-900/96 p-4 shadow-[0_24px_60px_rgba(0,0,0,0.65)] backdrop-blur-2xl">
+                <div className="settings-popover absolute right-0 top-12 z-50 w-80 space-y-3.5 rounded-2xl border border-white/14 bg-ink-900 p-5 shadow-[0_24px_60px_rgba(0,0,0,0.65)]">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-white">Library & Settings</span>
                     <button
@@ -651,10 +728,10 @@ export function HostPage() {
                       />
                       <button
                         type="submit"
-                        disabled={!health}
+                        disabled={!health || scanning || !folderPath.trim()}
                         className="btn-light shrink-0 px-3.5 py-1.5 text-[11px]"
                       >
-                        Add & Scan
+                        {scanning ? "Scanning…" : "Add & Scan"}
                       </button>
                     </div>
                   </form>
@@ -662,10 +739,14 @@ export function HostPage() {
                   <div className="flex items-center justify-between border-t border-white/8 pt-3">
                     <div>
                       <p className="text-xs font-medium text-white/85">Auto-Prepare Stems</p>
-                      <p className="text-[11px] text-white/45">Pre-separate next 2 queued tracks</p>
+                      <p className="text-[11px] text-white/45">{health?.demucs ? "Pre-separate next 2 queued tracks" : "Requires Demucs on the host"}</p>
                     </div>
                     <button
                       type="button"
+                      role="switch"
+                      aria-label="Auto-prepare stems"
+                      aria-checked={autoPrepareEnabled && Boolean(health?.demucs)}
+                      disabled={!health?.demucs}
                       onClick={() => setAutoPrepareEnabled((v) => !v)}
                       className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
                         autoPrepareEnabled && health?.demucs
@@ -673,7 +754,7 @@ export function HostPage() {
                           : "bg-white/10 text-white/60 hover:text-white"
                       }`}
                     >
-                      {autoPrepareEnabled ? "On" : "Off"}
+                      {!health?.demucs ? "Unavailable" : autoPrepareEnabled ? "On" : "Off"}
                     </button>
                   </div>
 
@@ -725,20 +806,36 @@ export function HostPage() {
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         {/* Left Clean Segmented Sidebar (Library | Party) — kept mounted in TV mode so room sync never disconnects */}
         <aside
+          id="host-sidebar"
           aria-hidden={tvMode}
           className={`${
             tvMode ? "hidden" : "flex"
-          } w-full shrink-0 flex-col border-b border-white/[0.06] bg-ink-900/95 p-3.5 lg:h-full lg:w-[348px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
+          } host-sidebar w-full shrink-0 flex-col border-b border-white/[0.06] bg-ink-900/95 p-4 lg:h-full lg:w-[310px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
         >
+          <div className="mb-5 flex items-center justify-between px-1">
+            <div><p className="eyebrow mb-1">Your collection</p><h1 className="text-lg font-semibold tracking-tight">Let’s hear it.</h1></div>
+            <button type="button" onClick={() => setSettingsOpen(true)} aria-label="Add music folder" className="btn-ghost h-10 w-10 text-xl">+</button>
+          </div>
           {/* Segmented Library / Party Switch */}
           <div
             role="tablist"
             aria-label="Sidebar view"
+            onKeyDown={(event) => {
+              if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+              event.preventDefault();
+              const next = event.key === "Home" ? "library" : event.key === "End" ? "party" : sidebarTab === "library" ? "party" : "library";
+              setSidebarTab(next);
+              event.currentTarget.querySelector<HTMLButtonElement>(`[data-tab="${next}"]`)?.focus();
+            }}
             className="mb-3 grid shrink-0 grid-cols-2 rounded-full border border-white/[0.08] bg-white/[0.04] p-1"
           >
             <button
               type="button"
               role="tab"
+              data-tab="library"
+              id="library-tab"
+              aria-controls="library-panel"
+              tabIndex={sidebarTab === "library" ? 0 : -1}
               aria-selected={sidebarTab === "library"}
               onClick={() => setSidebarTab("library")}
               className={`rounded-full py-1.5 text-xs font-semibold transition ${
@@ -752,6 +849,10 @@ export function HostPage() {
             <button
               type="button"
               role="tab"
+              data-tab="party"
+              id="party-tab"
+              aria-controls="party-panel"
+              tabIndex={sidebarTab === "party" ? 0 : -1}
               aria-selected={sidebarTab === "party"}
               onClick={() => setSidebarTab("party")}
               className={`flex items-center justify-center gap-1.5 rounded-full py-1.5 text-xs font-semibold transition ${
@@ -795,7 +896,7 @@ export function HostPage() {
           )}
 
           {/* Library Tab */}
-          <div className={`${sidebarTab === "library" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-2.5`}>
+          <div role="tabpanel" id="library-panel" aria-labelledby="library-tab" className={`${sidebarTab === "library" ? "flex" : "hidden"} min-h-0 flex-1 flex-col gap-2.5`}>
             {/* Clean Live Search + Shuffle */}
             <div className="flex shrink-0 items-center gap-1.5">
               <form
@@ -860,13 +961,14 @@ export function HostPage() {
             </div>
 
             {/* Full-Height Spacious Tracklist */}
-            <div className="thin-scroll min-h-[200px] flex-1 overflow-y-auto pr-0.5">
+            <div aria-busy={libraryLoading} className="library-scroll thin-scroll min-h-0 flex-1 overflow-y-auto pr-0.5">
               {songs.length === 0 ? (
                 <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center">
                   <p className="text-xs font-semibold text-white/75">
-                    {query ? "No matching songs" : "Add your music folder"}
+                    {libraryLoading ? "Loading your music…" : healthError ? "Host agent is offline" : query ? "No matching songs" : "Add your music folder"}
                   </p>
-                  {!query && (
+                  {healthError && <button type="button" className="btn-ghost px-4 py-2" onClick={() => void refresh()}>Reconnect</button>}
+                  {!query && !libraryLoading && !healthError && !settingsOpen && (
                     <form onSubmit={handleAddAndScan} className="w-full space-y-2">
                       <input
                         aria-label="Local music folder path"
@@ -877,10 +979,10 @@ export function HostPage() {
                       />
                       <button
                         type="submit"
-                        disabled={!health}
+                        disabled={!health || scanning || !folderPath.trim()}
                         className="btn-light w-full py-2 text-xs"
                       >
-                        Add & Scan
+                        {scanning ? "Scanning…" : "Add & Scan"}
                       </button>
                     </form>
                   )}
@@ -895,11 +997,13 @@ export function HostPage() {
                       <li
                         key={song.id}
                         className={`track-row group flex items-center justify-between gap-2 rounded-xl px-2 py-1.5 transition ${
-                          isActive ? "bg-white/[0.11]" : "hover:bg-white/[0.05]"
+                          isActive ? "bg-pink/12 ring-1 ring-inset ring-pink/20" : "hover:bg-white/[0.05]"
                         }`}
                       >
                         <button
                           type="button"
+                          disabled={song.readiness === "drm_rejected"}
+                          aria-current={isActive ? "true" : undefined}
                           onClick={() => selectSongForPlayback(song)}
                           className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                         >
@@ -939,6 +1043,7 @@ export function HostPage() {
                           <button
                             type="button"
                             aria-label="Play"
+                            disabled={song.readiness === "drm_rejected"}
                             title={isActive ? "Now Playing" : `Play ${cleanTitle}`}
                             onClick={() => selectSongForPlayback(song)}
                             className={`flex h-7 w-7 items-center justify-center rounded-full transition ${
@@ -961,16 +1066,17 @@ export function HostPage() {
                 <button
                   type="button"
                   onClick={() => void handleLoadMore()}
+                  disabled={loadingMore || libraryLoading}
                   className="btn-ghost mt-2 w-full py-1.5 text-xs"
                 >
-                  Load more
+                  {loadingMore ? "Loading…" : "Load more"}
                 </button>
               )}
             </div>
           </div>
 
           {/* Party Room Tab (kept mounted so LAN/Cloud sync never disconnects when browsing Library) */}
-          <div className={`${sidebarTab === "party" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
+          <div role="tabpanel" id="party-panel" aria-labelledby="party-tab" className={`${sidebarTab === "party" ? "flex" : "hidden"} thin-scroll min-h-0 flex-1 flex-col overflow-y-auto`}>
             <HostRoomPanel
               hostConnected={Boolean(health)}
               onPlayHostSong={handlePlayHostSong}
@@ -985,8 +1091,9 @@ export function HostPage() {
 
         {/* Right Main Full-Bleed Atmospheric Karaoke Stage */}
         <main
+          id="karaoke-stage"
           aria-label="Karaoke Stage"
-          className="relative flex min-h-0 flex-1 flex-col justify-center overflow-y-auto px-6 py-8 sm:px-10 lg:overflow-hidden lg:px-14"
+          className="karaoke-stage thin-scroll relative isolate flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-5 py-8 sm:px-8 lg:px-10"
         >
           {/* Flowing GPU-Composited Album-Adapted Backdrop */}
           <StageBackdrop
@@ -1049,15 +1156,15 @@ export function HostPage() {
 
           {activeSong ? (
             <div
-              className={`relative z-10 mx-auto grid w-full items-center gap-10 xl:gap-16 ${
+              className={`player-layout relative z-10 mx-auto my-auto grid w-full items-center gap-8 xl:gap-12 ${
                 tvMode
-                  ? "max-w-[1320px] xl:grid-cols-[410px_1fr]"
-                  : "max-w-6xl xl:grid-cols-[340px_1fr]"
+                  ? "max-w-[1320px] lg:grid-cols-[minmax(230px,0.8fr)_minmax(0,1.2fr)]"
+                  : "max-w-6xl lg:grid-cols-[minmax(220px,0.8fr)_minmax(0,1.2fr)]"
               }`}
             >
               {/* Left Artwork & Refined Centered Transport Pod */}
               <div
-                className={`mx-auto w-full space-y-5 ${
+                className={`player-artwork mx-auto w-full space-y-5 ${
                   tvMode ? "max-w-[400px]" : "max-w-[330px]"
                 }`}
               >
@@ -1069,173 +1176,35 @@ export function HostPage() {
                   className="aspect-square w-full rounded-2xl text-6xl shadow-[0_28px_72px_rgba(0,0,0,0.48)] ring-1 ring-white/12"
                 />
 
-                {/* Centered Track Title, Artist — Album, and Quality Pill */}
-                <div className="space-y-1 text-center">
-                  <h2 className="truncate text-lg font-bold tracking-tight text-white sm:text-[21px]">
-                    {displayTitle(activeSong.title)}
-                  </h2>
-                  <p className="truncate text-sm text-white/65" title={activeSubtitle}>
-                    {activeSubtitle}
-                  </p>
-                  <div className="flex items-center justify-center gap-2 pt-0.5">
-                    {qualityLabel && (
-                      <span className="inline-flex items-center gap-1 font-mono text-[10px] tracking-wider text-white/50">
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
-                          <path d="M4 12h2m3-5v10m4-13v16m4-11v6m3-3h0" />
-                        </svg>
-                        {qualityLabel}
-                      </span>
+                {/* Apple Music–style Left-Aligned Track Info + Quick Action Buttons */}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1 space-y-0.5 text-left">
+                    <h2 className="truncate text-lg font-bold tracking-tight text-white sm:text-[21px]">
+                      {displayTitle(activeSong.title)}
+                    </h2>
+                    <p className="truncate text-sm text-white/65" title={activeSubtitle}>
+                      {activeSubtitle}
+                    </p>
+                    {(qualityLabel || audioMode !== "original") && (
+                      <div className="flex items-center gap-2 pt-0.5">
+                        {qualityLabel && (
+                          <span className="inline-flex items-center gap-1 font-mono text-[10px] tracking-wider text-white/48">
+                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+                              <path d="M4 12h2m3-5v10m4-13v16m4-11v6m3-3h0" />
+                            </svg>
+                            {qualityLabel}
+                          </span>
+                        )}
+                        {audioMode !== "original" && (
+                          <span className="rounded-full bg-white/15 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-white">
+                            {audioMode}
+                          </span>
+                        )}
+                      </div>
                     )}
-                    {audioMode !== "original" && (
-                      <span className="rounded-full bg-white/15 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-white">
-                        {audioMode}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Single-Row Airy Timeline Scrub Bar */}
-                <div className="flex items-center gap-3">
-                  <span className="w-9 font-mono text-[11px] tabular-nums text-white/60">
-                    {formatSec(currentSec)}
-                  </span>
-                  <div className="relative flex flex-1 items-center">
-                    <div className="pointer-events-none absolute inset-x-0 h-1 overflow-hidden rounded-full bg-white/20">
-                      <div
-                        className="h-full rounded-full bg-white/85"
-                        style={{ width: `${progressPct}%` }}
-                      />
-                    </div>
-                    <input
-                      type="range"
-                      aria-label="Seek playback position"
-                      min={0}
-                      max={durationSec || 1}
-                      step={0.1}
-                      value={Math.min(currentSec, durationSec || 1)}
-                      onChange={(e) => {
-                        const next = Number(e.target.value);
-                        setCurrentSec(next);
-                        if (audioRef.current) audioRef.current.currentTime = next;
-                      }}
-                      className="range relative z-10 h-1 w-full cursor-pointer bg-transparent"
-                    />
-                  </div>
-                  <span className="w-10 text-right font-mono text-[11px] tabular-nums text-white/60">
-                    -{formatSec(remainingSec)}
-                  </span>
-                </div>
-
-                {/* Clean Horizontal Transport & Stem Control Strip */}
-                <div className="relative flex items-center justify-between pt-0.5 text-white/80">
-                  {/* Left: Volume + Stem Menu */}
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      aria-label={muted ? "Unmute audio" : "Mute audio"}
-                      onClick={() => setShowVolumeSlider((v) => !v)}
-                      onDoubleClick={() => setMuted((m) => !m)}
-                      className="flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white"
-                      title="Volume (click to adjust, M to mute)"
-                    >
-                      {muted || volume === 0 ? (
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" />
-                          <line x1="23" y1="9" x2="17" y2="15" />
-                          <line x1="17" y1="9" x2="23" y2="15" />
-                        </svg>
-                      ) : (
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" />
-                          <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                          <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                        </svg>
-                      )}
-                    </button>
-
-                    <button
-                      type="button"
-                      aria-label="Toggle shuffle"
-                      aria-pressed={shuffleEnabled}
-                      onClick={() => setShuffleEnabled((v) => !v)}
-                      className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
-                        shuffleEnabled ? "bg-white/22 text-white" : ""
-                      }`}
-                      title={shuffleEnabled ? "Shuffle On (S)" : "Shuffle Off (S)"}
-                    >
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                        <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22" />
-                        <path d="m18 2 4 4-4 4" />
-                        <path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2" />
-                        <path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8" />
-                        <path d="m18 14 4 4-4 4" />
-                      </svg>
-                    </button>
-
-                    <button
-                      type="button"
-                      aria-label="Audio stem options"
-                      onClick={() => setStemMenuOpen((v) => !v)}
-                      className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
-                        stemMenuOpen ? "bg-white/15 text-white" : ""
-                      }`}
-                      title="Vocal / Instrumental stem options"
-                    >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <circle cx="5" cy="12" r="2" />
-                        <circle cx="12" cy="12" r="2" />
-                        <circle cx="19" cy="12" r="2" />
-                      </svg>
-                    </button>
                   </div>
 
-                  {/* Center: Previous / Play-Pause / Next */}
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => stepLibraryTrack(-1)}
-                      aria-label="Previous track or restart"
-                      className="flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white"
-                    >
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <polygon points="11 19 2 12 11 5 11 19" />
-                        <polygon points="22 19 13 12 22 5 22 19" />
-                      </svg>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={togglePlayPause}
-                      aria-label={isPlaying ? "Pause playback" : "Resume playback"}
-                      className="flex h-11 w-11 items-center justify-center rounded-full text-white transition hover:scale-105 hover:bg-white/15 active:scale-95"
-                    >
-                      {isPlaying ? (
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                          <rect x="6" y="4" width="4.2" height="16" rx="1.2" />
-                          <rect x="13.8" y="4" width="4.2" height="16" rx="1.2" />
-                        </svg>
-                      ) : (
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                          <polygon points="6 4 20 12 6 20 6 4" />
-                        </svg>
-                      )}
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => stepLibraryTrack(1)}
-                      aria-label="Next track"
-                      className="flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white"
-                    >
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <polygon points="13 19 22 12 13 5 13 19" />
-                        <polygon points="2 19 11 12 2 5 2 19" />
-                      </svg>
-                    </button>
-                  </div>
-
-                  {/* Right: Quick Vocal/Instrumental Toggle + Lyrics Sync/Editor Button */}
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex shrink-0 items-center gap-1.5 pt-0.5 text-white/80">
                     <button
                       type="button"
                       onClick={() => {
@@ -1256,15 +1225,15 @@ export function HostPage() {
                           ? "Karaoke Vocal Mix (0%–100%)"
                           : "Prepare Instrumental Stem with Demucs"
                       }
-                      className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 transition hover:bg-white/20 hover:text-white ${
                         audioMode === "instrumental"
-                          ? "bg-white/22 text-white"
+                          ? "border-white/30 bg-white/25 text-white"
                           : jobIsActive && activeJob?.song_id === activeSong.id
-                            ? "animate-pulse bg-sky/25 text-sky"
+                            ? "animate-pulse border-sky/40 bg-sky/25 text-sky"
                             : ""
                       }`}
                     >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                         <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
                         <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                         <line x1="12" y1="19" x2="12" y2="22" />
@@ -1273,14 +1242,32 @@ export function HostPage() {
 
                     <button
                       type="button"
+                      aria-label="Audio stem options"
+                      aria-expanded={stemMenuOpen}
+                      onClick={() => setStemMenuOpen((v) => !v)}
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 transition hover:bg-white/20 hover:text-white ${
+                        stemMenuOpen ? "border-white/30 bg-white/25 text-white" : ""
+                      }`}
+                      title="Vocal / Instrumental stem options"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <circle cx="5" cy="12" r="2" />
+                        <circle cx="12" cy="12" r="2" />
+                        <circle cx="19" cy="12" r="2" />
+                      </svg>
+                    </button>
+
+                    <button
+                      type="button"
                       onClick={() => setLyricsEditorOpen((v) => !v)}
                       aria-label="Toggle lyrics editor and timing"
+                      aria-expanded={lyricsEditorOpen}
                       title="Edit / Sync Lyrics"
-                      className={`flex h-9 w-9 items-center justify-center rounded-lg transition hover:bg-white/12 hover:text-white ${
-                        lyricsEditorOpen ? "bg-white/22 text-white" : "bg-white/10 text-white/90"
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 transition hover:bg-white/20 hover:text-white ${
+                        lyricsEditorOpen ? "border-white/30 bg-white/25 text-white" : ""
                       }`}
                     >
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                         <path d="M8 9h8M8 13h5" />
                       </svg>
@@ -1288,9 +1275,167 @@ export function HostPage() {
                   </div>
                 </div>
 
+                {/* Apple Music Full-Width Seek Bar with Timestamps Underneath */}
+                <div className="space-y-1.5">
+                  <div className="relative flex items-center">
+                    <div className="pointer-events-none absolute inset-x-0 h-1 overflow-hidden rounded-full bg-white/20">
+                      <div
+                        className="h-full rounded-full bg-white/90"
+                        style={{ width: `${progressPct}%` }}
+                      />
+                    </div>
+                    <input
+                      type="range"
+                      aria-label="Seek playback position"
+                      min={0}
+                      max={durationSec || 1}
+                      step={0.1}
+                      value={Math.min(currentSec, durationSec || 1)}
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        setCurrentSec(next);
+                        if (audioRef.current) audioRef.current.currentTime = next;
+                      }}
+                      className="range relative z-10 h-1 w-full cursor-pointer bg-transparent"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between font-mono text-[11px] tabular-nums text-white/55">
+                    <span>{formatSec(currentSec)}</span>
+                    <span>-{formatSec(remainingSec)}</span>
+                  </div>
+                </div>
+
+                {/* Centered 5-Control Transport Row: Shuffle · Prev · Play/Pause · Next · Repeat */}
+                <div className="flex items-center justify-center gap-4 text-white/80 sm:gap-5">
+                  <button
+                    type="button"
+                    aria-label="Toggle shuffle"
+                    aria-pressed={shuffleEnabled}
+                    onClick={() => setShuffleEnabled((v) => !v)}
+                    className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
+                      shuffleEnabled ? "bg-white/20 text-white" : "text-white/55"
+                    }`}
+                    title={shuffleEnabled ? "Shuffle On (S)" : "Shuffle Off (S)"}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22" />
+                      <path d="m18 2 4 4-4 4" />
+                      <path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2" />
+                      <path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8" />
+                      <path d="m18 14 4 4-4 4" />
+                    </svg>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => stepLibraryTrack(-1)}
+                    aria-label="Previous track or restart"
+                    className="flex h-10 w-10 items-center justify-center rounded-full text-white/90 transition hover:bg-white/12 hover:text-white"
+                  >
+                    <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <polygon points="11 19 2 12 11 5 11 19" />
+                      <polygon points="22 19 13 12 22 5 22 19" />
+                    </svg>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={togglePlayPause}
+                    aria-label={isPlaying ? "Pause playback" : "Resume playback"}
+                    className="flex h-12 w-12 items-center justify-center rounded-full text-white transition hover:scale-105 hover:bg-white/15 active:scale-95"
+                  >
+                    {isPlaying ? (
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <rect x="6" y="4" width="4.4" height="16" rx="1.2" />
+                        <rect x="13.6" y="4" width="4.4" height="16" rx="1.2" />
+                      </svg>
+                    ) : (
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <polygon points="6 4 20 12 6 20 6 4" />
+                      </svg>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => stepLibraryTrack(1)}
+                    aria-label="Next track"
+                    className="flex h-10 w-10 items-center justify-center rounded-full text-white/90 transition hover:bg-white/12 hover:text-white"
+                  >
+                    <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <polygon points="13 19 22 12 13 5 13 19" />
+                      <polygon points="2 19 11 12 2 5 2 19" />
+                    </svg>
+                  </button>
+
+                  <button
+                    type="button"
+                    aria-label="Toggle repeat track"
+                    aria-pressed={repeatOne}
+                    onClick={() => setRepeatOne((v) => !v)}
+                    className={`flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white ${
+                      repeatOne ? "bg-white/20 text-white" : "text-white/55"
+                    }`}
+                    title={repeatOne ? "Repeat Track On (R)" : "Repeat Track Off (R)"}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="m17 2 4 4-4 4" />
+                      <path d="M3 11v-1a4 4 0 0 1 4-4h14" />
+                      <path d="m7 22-4-4 4-4" />
+                      <path d="M21 13v1a4 4 0 0 1-4 4H3" />
+                    </svg>
+                  </button>
+                </div>
+
+                {/* Always-Visible Slim Volume Bar (Apple Music–style) */}
+                <div className="flex items-center gap-3 pt-0.5 text-white/70">
+                  <button
+                    type="button"
+                    aria-label={muted ? "Unmute audio" : "Mute audio"}
+                    onClick={() => setMuted((m) => !m)}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition hover:bg-white/12 hover:text-white"
+                    title="Mute / Unmute (M)"
+                  >
+                    {muted || volume === 0 ? (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" />
+                        <line x1="23" y1="9" x2="17" y2="15" />
+                        <line x1="17" y1="9" x2="23" y2="15" />
+                      </svg>
+                    ) : (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" />
+                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                      </svg>
+                    )}
+                  </button>
+                  <div className="relative flex flex-1 items-center">
+                    <div className="pointer-events-none absolute inset-x-0 h-1 overflow-hidden rounded-full bg-white/18">
+                      <div
+                        className="h-full rounded-full bg-white/80"
+                        style={{ width: `${muted ? 0 : Math.round(volume * 100)}%` }}
+                      />
+                    </div>
+                    <input
+                      type="range"
+                      aria-label="Master volume"
+                      min={0}
+                      max={1}
+                      step={0.02}
+                      value={muted ? 0 : volume}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setVolume(v);
+                        if (v > 0 && muted) setMuted(false);
+                      }}
+                      className="range relative z-10 h-1 w-full cursor-pointer bg-transparent"
+                    />
+                  </div>
+                </div>
+
                 {/* Real-Time Apple Music Sing–style Vocal Mix Slider (when instrumental stem is active) */}
                 {showVocalSlider && activeSong.has_instrumental && audioMode === "instrumental" && (
-                  <div className="flex items-center gap-2.5 rounded-full border border-white/15 bg-black/45 px-3.5 py-2">
+                  <div className="flex items-center gap-2.5 rounded-full border border-white/15 bg-black/35 px-3.5 py-2 backdrop-blur-md">
                     <span className="font-mono text-[10px] uppercase tracking-wider text-white/75">
                       Vocals
                     </span>
@@ -1306,36 +1451,6 @@ export function HostPage() {
                     />
                     <span className="w-9 text-right font-mono text-[10px] text-white/70">
                       {Math.round(vocalMix * 100)}%
-                    </span>
-                  </div>
-                )}
-
-                {/* Inline Expandable Volume Bar */}
-                {showVolumeSlider && (
-                  <div className="flex items-center gap-2.5 rounded-full border border-white/12 bg-black/35 px-3.5 py-2 backdrop-blur-xl">
-                    <button
-                      type="button"
-                      onClick={() => setMuted((m) => !m)}
-                      className="font-mono text-[10px] uppercase tracking-wider text-white/75 hover:text-white"
-                    >
-                      {muted ? "Muted" : "Vol"}
-                    </button>
-                    <input
-                      type="range"
-                      aria-label="Master volume"
-                      min={0}
-                      max={1}
-                      step={0.02}
-                      value={muted ? 0 : volume}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setVolume(v);
-                        if (v > 0 && muted) setMuted(false);
-                      }}
-                      className="range h-1 flex-1 cursor-pointer"
-                    />
-                    <span className="w-8 text-right font-mono text-[10px] text-white/60">
-                      {muted ? "0%" : `${Math.round(volume * 100)}%`}
                     </span>
                   </div>
                 )}
@@ -1415,6 +1530,7 @@ export function HostPage() {
               {/* Right Spacious Lyrics Stage */}
               <div className="min-w-0">
                 <LyricsPanel
+                  key={activeSong.id}
                   song={activeSong}
                   audioRef={audioRef}
                   tvMode={tvMode}
@@ -1442,10 +1558,19 @@ export function HostPage() {
             </div>
           ) : (
             /* Clean Real-Library Quick Launch Grid (No Placeholders) */
-            <div className="relative z-10 mx-auto w-full max-w-4xl space-y-6">
+            <div className="relative z-10 mx-auto my-auto w-full max-w-5xl space-y-7">
+              {!tvMode && <div className="library-welcome">
+                <p className="eyebrow text-rose-200/70">Set the mood. Take the mic.</p>
+                <h2 className="mt-3 text-3xl font-bold tracking-[-0.04em] sm:text-5xl">Your next encore<br /><span className="text-rose-200">starts here.</span></h2>
+                <p className="mt-4 max-w-md text-sm leading-6 text-white/60">Pick a favourite, warm up your vocals, and make the room yours.</p>
+                <div className="mt-6 flex flex-wrap gap-2">
+                  <button type="button" onClick={() => { setSidebarTab("party"); if (window.innerWidth < 1024) document.getElementById("host-sidebar")?.scrollIntoView({ behavior: "smooth" }); }} className="btn-primary px-5 py-2.5">Open party room <span aria-hidden="true">↗</span></button>
+                  <button type="button" onClick={() => setSettingsOpen(true)} className="btn-ghost px-5 py-2.5">Add music</button>
+                </div>
+              </div>}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-2xl font-bold tracking-[-0.03em] text-white sm:text-3xl">
-                  Your Library
+                  {query ? "Search results" : "Made for an encore"}
                 </h2>
                 <div className="flex items-center gap-2">
                   {songs.length > 8 && (
@@ -1498,14 +1623,17 @@ export function HostPage() {
                   onMouseLeave={() => {
                     featuredHoveredRef.current = false;
                   }}
-                  className="grid grid-cols-2 gap-5 sm:grid-cols-3 md:grid-cols-4"
+                  onFocusCapture={() => { featuredHoveredRef.current = true; }}
+                  onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) featuredHoveredRef.current = false; }}
+                  className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4"
                 >
-                  {(featuredSongs.length > 0 ? featuredSongs : songs.slice(0, 8)).map((song) => (
+                  {(query ? songs.slice(0, 8) : featuredSongs.length > 0 ? featuredSongs : songs.slice(0, 8)).map((song) => (
                     <button
                       key={song.id}
                       type="button"
+                      disabled={song.readiness === "drm_rejected"}
                       onClick={() => selectSongForPlayback(song)}
-                      className="group rounded-2xl p-2 text-left transition hover:bg-white/[0.06]"
+                      className="album-card group rounded-2xl border border-white/[0.06] bg-white/[0.025] p-2.5 text-left transition hover:border-white/20 hover:bg-white/[0.06]"
                     >
                       <div className="relative overflow-hidden rounded-xl shadow-[0_12px_32px_rgba(0,0,0,0.45)]">
                         <Cover
@@ -1532,7 +1660,7 @@ export function HostPage() {
               ) : (
                 <div className="surface p-8 text-center">
                   <p className="text-sm text-snow/65">
-                    Add your local music folder in the left sidebar (e.g. <code className="font-mono text-sky">D:\Music</code>) to start singing.
+                    {libraryLoading ? "Getting your library ready…" : healthError ? "Start the local host agent, then reconnect to access your music." : query ? "No songs match this search. Try another title or artist." : "Add your music folder using Add music to start singing. Your files stay on your computer."}
                   </p>
                 </div>
               )}
@@ -1542,8 +1670,6 @@ export function HostPage() {
           {/* Persistent audio elements stay mounted across idle/stage transitions so tap-to-play unlocks autoplay synchronously */}
           <audio
             ref={audioRef}
-            autoPlay
-            src={activeSong ? mediaUrl(activeSong.id, audioMode) : undefined}
             onLoadedMetadata={() => {
               if (audioRef.current) {
                 audioRef.current.volume = volume;
@@ -1571,8 +1697,19 @@ export function HostPage() {
               if (!primary) return;
               setCurrentSec(primary.currentTime);
               const voc = vocalAudioRef.current;
-              if (voc && Math.abs(voc.currentTime - primary.currentTime) > 0.14) {
+              if (voc && Math.abs(voc.currentTime - primary.currentTime) > 0.08) {
                 voc.currentTime = primary.currentTime;
+              }
+            }}
+            onWaiting={() => {
+              vocalAudioRef.current?.pause();
+            }}
+            onPlaying={() => {
+              const primary = audioRef.current;
+              const voc = vocalAudioRef.current;
+              if (voc && primary && !primary.paused) {
+                voc.currentTime = primary.currentTime;
+                void voc.play().catch(() => {});
               }
             }}
             onSeeked={() => {
@@ -1585,6 +1722,8 @@ export function HostPage() {
               if (!activeSong) return;
               if (audioMode !== "original") {
                 setStatusMsg("Instrumental unavailable; playing original.");
+                resumePosRef.current = audioRef.current?.currentTime ?? 0;
+                shouldAutoPlayRef.current = isPlaying || shouldAutoPlayRef.current;
                 setAudioMode("original");
               } else {
                 setStatusMsg(
@@ -1608,8 +1747,14 @@ export function HostPage() {
             }}
             onEnded={() => {
               setIsPlaying(false);
-              emitPlayback("ended");
               vocalAudioRef.current?.pause();
+              if (repeatOne && audioRef.current) {
+                audioRef.current.currentTime = 0;
+                if (vocalAudioRef.current) vocalAudioRef.current.currentTime = 0;
+                void audioRef.current.play().catch(() => {});
+                return;
+              }
+              emitPlayback("ended");
               if (!stageRoom?.playNext && shuffleEnabled) {
                 void playNextShuffled(true);
               }

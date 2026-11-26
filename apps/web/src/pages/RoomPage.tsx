@@ -408,7 +408,7 @@ export function RoomPage() {
     return (
       <div className="stage-ambient min-h-screen text-snow">
         <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-          <div className="surface p-7 space-y-5 shadow-2xl">
+          <div className="surface p-7 space-y-6 shadow-2xl">
             <div className="flex items-center justify-between gap-2">
               <Logo size={26} suffix="Join" />
               <span className="rounded-full border border-white/12 bg-white/[0.04] px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-snow/60">
@@ -422,6 +422,7 @@ export function RoomPage() {
               </h1>
             </div>
             <form onSubmit={handleJoin} className="space-y-3">
+              <p className="text-sm leading-6 text-white/60">You’re on the guest list. Choose a name, queue your favourites, and sing along.</p>
               <input
                 aria-label="Your display name"
                 value={displayName}
@@ -458,7 +459,7 @@ export function RoomPage() {
   }
 
   return (
-    <div className="min-h-screen bg-ink-950 text-snow">
+    <div className="stage-ambient min-h-dvh text-snow">
       <main className="mx-auto max-w-2xl space-y-4 px-4 py-6 sm:px-5">
         <header className="surface flex items-center justify-between gap-2 px-4 py-3 sm:px-5">
           <div className="flex min-w-0 items-center gap-2.5">
@@ -653,7 +654,7 @@ export function RoomPage() {
               </span>
             )}
           </div>
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             {REACTION_BUTTONS.map(({ label, icon }) => (
               <button
                 key={label}
@@ -684,7 +685,7 @@ export function RoomPage() {
           </div>
 
           {filteredSongs.length === 0 ? (
-            <p className="text-xs text-snow/45">No songs published by the host yet.</p>
+            <p className="py-5 text-sm text-snow/60">{search.trim() ? "No songs match your search. Try another title or artist." : "The host hasn’t shared any songs yet. They’ll appear here when the library is ready."}</p>
           ) : (
             <ul className="divide-y divide-white/6">
               {filteredSongs.map((song) => {

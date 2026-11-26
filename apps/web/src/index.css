@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink-950: #050507;
-  --color-ink-900: #0c0c10;
+  --color-ink-950: #0c0b0f;
+  --color-ink-900: #141217;
   --color-ink-850: #131319;
   --color-ink-800: #1a1a22;
   --color-sky: #38bdf8;
@@ -16,13 +16,22 @@ body {
   background: var(--color-ink-950);
   color: var(--color-snow);
   -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
+  margin: 0;
+  min-width: 320px;
+  color-scheme: dark;
+  font-family: var(--font-sans);
 }
+
+button, a, input { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled), [role="tab"] { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+::selection { background: #fb1e5355; color: white; }
 
 @layer components {
   .btn-primary {
     @apply inline-flex items-center justify-center gap-1.5 rounded-full bg-gradient-to-b from-[#fa2d48] to-[#d92662] font-sans text-xs font-semibold tracking-normal text-white shadow-[0_6px_20px_rgba(250,45,72,0.26)] transition hover:brightness-110 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40;
   }
+  .btn-primary, .btn-light, .btn-ghost { min-height: 40px; }
   .btn-light {
     @apply inline-flex items-center justify-center gap-1.5 rounded-full bg-white/95 font-sans text-xs font-semibold tracking-normal text-ink-950 shadow-sm transition hover:bg-white active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40;
   }
@@ -32,12 +41,50 @@ body {
   .field {
     @apply w-full rounded-xl border border-white/12 bg-white/[0.05] px-3.5 py-2 text-sm text-snow outline-none transition placeholder:text-snow/38 focus:border-white/35 focus:bg-white/[0.08];
   }
+  .field { min-height: 42px; }
   .surface {
     @apply rounded-2xl border border-white/[0.09] bg-white/[0.035] backdrop-blur-xl;
   }
   .eyebrow {
     @apply text-[11px] font-semibold uppercase tracking-[0.12em] text-snow/48;
   }
+}
+
+.home-shell {
+  background: #08080c;
+}
+.host-shell > header { min-height: 70px; }
+.host-sidebar { position: relative; z-index: 20; }
+.library-welcome { position: relative; overflow: hidden; border: 1px solid #ffffff12; border-radius: 20px; padding: clamp(24px, 3vw, 40px); background: radial-gradient(ellipse at 100% 10%, #b54f6950, transparent 65%), linear-gradient(115deg, #241c25, #18151c); }
+.library-welcome::after { content: "♪"; position: absolute; right: 5%; top: -35px; font-size: 280px; line-height: 1; color: #f5adb514; transform: rotate(-16deg); pointer-events: none; }
+.library-welcome > * { position: relative; z-index: 1; }
+.karaoke-stage { scroll-padding-block: 32px; }
+.track-row:focus-within { background-color: #ffffff0d; }
+.album-card:focus-visible { transform: translateY(-3px); }
+.album-card:focus-visible span { opacity: 1; }
+.settings-popover { max-height: calc(100dvh - 100px); overflow-y: auto; }
+.thin-scroll { scrollbar-width: thin; scrollbar-color: #ffffff30 transparent; }
+.lyrics-dock { opacity: 0; }
+.group\/lyrics:hover .lyrics-dock, .lyrics-dock:hover, .lyrics-dock:focus-within { opacity: 1; }
+
+@media (max-width: 1023px) {
+  .host-sidebar { max-height: 410px; }
+  .library-scroll { max-height: 230px; }
+  .karaoke-stage { flex: 1 0 auto; }
+  .settings-popover { position: fixed; top: 76px; right: 12px; width: min(340px, calc(100vw - 24px)); }
+  .player-artwork > div:first-child { max-width: 240px; margin-inline: auto; }
+  .is-tv .karaoke-stage { min-height: 100dvh; padding-top: 80px; }
+}
+@media (max-width: 479px) {
+  .host-shell > header { padding-inline: 12px; }
+  .host-shell > header .btn-primary { padding-inline: 12px; font-size: 11px; }
+}
+@media (hover: none) {
+  .player-artwork button { min-width: 40px; min-height: 40px; }
+  .track-row button { opacity: 1; min-height: 40px; }
+  .album-card span { opacity: 1; }
+  .range { min-height: 8px; }
+  .range::-webkit-slider-thumb { height: 20px; width: 20px; }
 }
 
 .stage-ambient {
@@ -86,8 +133,59 @@ body {
 }
 
 .lyrics-mask {
-  -webkit-mask-image: linear-gradient(to bottom, transparent, black 14%, black 86%, transparent);
-  mask-image: linear-gradient(to bottom, transparent, black 14%, black 86%, transparent);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 83%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 83%, transparent 100%);
+}
+
+/* Apple Music Sing–style gliding lyric lines & per-word progressive glow */
+.lyric-line {
+  transform-origin: left center;
+  transition:
+    transform 0.56s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.44s ease,
+    filter 0.44s ease;
+  will-change: transform, opacity;
+}
+
+.lyric-line:hover,
+.lyric-line:focus-visible {
+  filter: none !important;
+  opacity: 0.94 !important;
+}
+
+.lyric-word {
+  display: inline-block;
+  color: rgba(255, 255, 255, 0.38);
+  transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), filter 0.28s ease;
+}
+
+.lyric-word[data-state="singing"] {
+  background-image: linear-gradient(
+    90deg,
+    #ffffff 0%,
+    #ffffff calc(var(--wf, 0%) * 1.18 - 18%),
+    rgba(255, 255, 255, 0.38) calc(var(--wf, 0%) * 1.18),
+    rgba(255, 255, 255, 0.38) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  transform: translateY(-1.5px);
+  filter: drop-shadow(0 0 14px rgba(255, 255, 255, 0.34));
+}
+
+.lyric-word[data-state="past"] {
+  color: #ffffff;
+  -webkit-text-fill-color: #ffffff;
+  transform: translateY(0);
+  filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.16));
+}
+
+.lyric-word[data-state="upcoming"] {
+  color: rgba(255, 255, 255, 0.38);
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.38);
+  transform: translateY(0);
+  filter: none;
 }
 
 .thin-scroll::-webkit-scrollbar {
@@ -285,7 +383,9 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .aura-blob {
+  *, *::before, *::after {
     animation: none !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }

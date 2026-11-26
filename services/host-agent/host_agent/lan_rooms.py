@@ -202,7 +202,21 @@ class LanRoomManager:
         self.rooms_by_id: dict[str, _LanRoomState] = {}
         self.code_to_id: dict[str, str] = {}
 
+    def cleanup_expired(self) -> None:
+        now_iso = _now_iso()
+        stale_ids = [
+            rid
+            for rid, st in self.rooms_by_id.items()
+            if (st.room["status"] == "closed" or st.room["expires_at"] < now_iso)
+            and not st.connections
+        ]
+        for rid in stale_ids:
+            st = self.rooms_by_id.pop(rid, None)
+            if st:
+                self.code_to_id.pop(st.room["code"], None)
+
     def create_room(self) -> _LanRoomState:
+        self.cleanup_expired()
         code = _generate_room_code(set(self.code_to_id.keys()))
         state = _LanRoomState(code)
         self.rooms_by_id[state.room["id"]] = state

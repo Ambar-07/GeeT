@@ -580,7 +580,7 @@ export function HostRoomPanel({
   }
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col gap-3.5 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 backdrop-blur-xl">
+    <section className="thin-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 backdrop-blur-xl">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <h2 className="eyebrow">Party Room</h2>

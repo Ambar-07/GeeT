@@ -3,6 +3,7 @@ import {
   computeEffectiveTimeMs,
   findActiveLineIndex,
   getInterludeState,
+  getLineWords,
   hasDevanagari,
   isInstrumentalLine,
   parseLrc,
@@ -72,6 +73,7 @@ export function LyricsPanel({
   const [showSyncDock, setShowSyncDock] = useState(false);
   const [autoFetching, setAutoFetching] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [romanize, setRomanize] = useState<boolean>(() => {
     try {
       return localStorage.getItem(ROMANIZE_STORAGE_KEY) === "1";
@@ -93,6 +95,7 @@ export function LyricsPanel({
   const stageRef = useRef<HTMLDivElement | null>(null);
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
   const interludeRef = useRef<HTMLDivElement | null>(null);
+  const manualScrollUntilRef = useRef<number>(0);
   const onLyricsSyncedRef = useRef(onLyricsSynced);
   onLyricsSyncedRef.current = onLyricsSynced;
   const onLyricsChangeRef = useRef(onLyricsChange);
@@ -106,6 +109,11 @@ export function LyricsPanel({
   const lines = useMemo(
     () => parseLrc(lrcText, song.duration_ms || undefined),
     [lrcText, song.duration_ms]
+  );
+
+  const lineWordsMap = useMemo(
+    () => lines.map((line) => (isInstrumentalLine(line.text) ? [] : getLineWords(line))),
+    [lines]
   );
 
   // Fallback for tracks with embedded plain (unsynced) lyrics in ©lyr / USLT tags
@@ -152,6 +160,7 @@ export function LyricsPanel({
     setActiveIdx(-1);
     setInterlude(null);
     setAutoFetching(false);
+    manualScrollUntilRef.current = 0;
 
     fetchLyrics(song.id)
       .then(async (rec) => {
@@ -162,7 +171,6 @@ export function LyricsPanel({
         setSyncReady(rec.synchronized_ready);
         setLoadedSongId(song.id);
 
-        // Automatically query LRCLIB once per song when synced lyrics aren't cached yet
         if (
           !rec.synchronized_ready &&
           song.title.trim() &&
@@ -203,14 +211,22 @@ export function LyricsPanel({
     };
   }, [song.id, song.title, song.artist]);
 
-  // Run RAF only while audio is actively playing; sync immediately on seek/timeupdate
+  // 60 FPS word-by-word illumination + critically-damped spring scroll glide (zero React re-renders per frame)
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || lines.length === 0) return;
 
-    let rafId = 0;
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
-    const syncOnce = () => {
+    let rafId = 0;
+    let lastTs = performance.now();
+
+    const syncFrame = (now: number) => {
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastTs) / 1000));
+      lastTs = now;
+
       const effMs = computeEffectiveTimeMs(audio.currentTime, offsetMs);
       const nextIdx = findActiveLineIndex(lines, effMs);
       setActiveIdx((prev) => (prev === nextIdx ? prev : nextIdx));
@@ -230,19 +246,65 @@ export function LyricsPanel({
         return nextInterlude;
       });
 
-      if (nextIdx >= 0 && !isInstrumentalLine(lines[nextIdx].text)) {
-        const cur = lines[nextIdx];
-        const span = Math.max(250, cur.endMs - cur.startMs);
-        const pct = Math.round(Math.min(100, Math.max(12, ((effMs - cur.startMs) / span) * 100)));
-        if (activeLineRef.current) {
-          activeLineRef.current.style.setProperty("--sweep", `${pct}%`);
+      // Update per-word progressive glow directly on DOM spans
+      const lineBtn = activeLineRef.current;
+      if (lineBtn && nextIdx >= 0 && !isInstrumentalLine(lines[nextIdx].text)) {
+        const words = lineWordsMap[nextIdx];
+        if (words && words.length > 0) {
+          const wordEls = lineBtn.querySelectorAll<HTMLElement>("[data-word-idx]");
+          for (let i = 0; i < wordEls.length && i < words.length; i++) {
+            const w = words[i];
+            const el = wordEls[i];
+            const span = Math.max(60, w.endMs - w.startMs);
+            if (effMs < w.startMs) {
+              el.style.setProperty("--wf", "0%");
+              if (el.dataset.state !== "upcoming") el.dataset.state = "upcoming";
+            } else if (effMs >= w.endMs) {
+              el.style.setProperty("--wf", "100%");
+              if (el.dataset.state !== "past") el.dataset.state = "past";
+            } else {
+              const pct = ((effMs - w.startMs) / span) * 100;
+              el.style.setProperty("--wf", `${pct.toFixed(1)}%`);
+              if (el.dataset.state !== "singing") el.dataset.state = "singing";
+            }
+          }
+        }
+      }
+
+      // Critically-damped glide scroll toward active focal line (yields if user manually scrolls)
+      const container = stageRef.current;
+      const targetEl =
+        nextInterlude && nextInterlude.kind === "interlude" && interludeRef.current
+          ? interludeRef.current
+          : activeLineRef.current;
+
+      if (container && targetEl && now > manualScrollUntilRef.current) {
+        const targetTop = Math.max(
+          0,
+          targetEl.offsetTop - container.clientHeight * 0.34 + targetEl.clientHeight / 2
+        );
+        const diff = targetTop - container.scrollTop;
+        if (reducedMotion || Math.abs(diff) < 0.6) {
+          if (Math.abs(diff) >= 0.5) container.scrollTop = targetTop;
+        } else {
+          // Smooth Apple Music exponential glide
+          container.scrollTop += diff * (1 - Math.exp(-7.2 * dt));
         }
       }
     };
 
-    const tick = () => {
-      syncOnce();
-      if (!audio.paused && !audio.ended) {
+    const tick = (now: number) => {
+      syncFrame(now);
+      const container = stageRef.current;
+      const targetEl = interludeRef.current ?? activeLineRef.current;
+      const stillGliding =
+        Boolean(container && targetEl && now > manualScrollUntilRef.current) &&
+        Math.abs(
+          Math.max(0, targetEl!.offsetTop - container!.clientHeight * 0.34 + targetEl!.clientHeight / 2) -
+            container!.scrollTop
+        ) > 1.2;
+
+      if ((!audio.paused && !audio.ended) || stillGliding) {
         rafId = requestAnimationFrame(tick);
       } else {
         rafId = 0;
@@ -250,64 +312,78 @@ export function LyricsPanel({
     };
 
     const startLoop = () => {
+      lastTs = performance.now();
       if (!rafId) rafId = requestAnimationFrame(tick);
     };
 
-    const stopLoop = () => {
-      if (rafId) {
-        cancelAnimationFrame(rafId);
-        rafId = 0;
-      }
-      syncOnce();
+    const onInstantSync = () => {
+      manualScrollUntilRef.current = 0;
+      syncFrame(performance.now());
+      startLoop();
+    };
+
+    const onPauseOrEnd = () => {
+      syncFrame(performance.now());
     };
 
     audio.addEventListener("play", startLoop);
-    audio.addEventListener("pause", stopLoop);
-    audio.addEventListener("ended", stopLoop);
-    audio.addEventListener("seeked", syncOnce);
-    audio.addEventListener("loadedmetadata", syncOnce);
+    audio.addEventListener("pause", onPauseOrEnd);
+    audio.addEventListener("ended", onPauseOrEnd);
+    audio.addEventListener("seeked", onInstantSync);
+    audio.addEventListener("loadedmetadata", onInstantSync);
 
-    syncOnce();
+    syncFrame(performance.now());
     if (!audio.paused && !audio.ended) startLoop();
 
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
       audio.removeEventListener("play", startLoop);
-      audio.removeEventListener("pause", stopLoop);
-      audio.removeEventListener("ended", stopLoop);
-      audio.removeEventListener("seeked", syncOnce);
-      audio.removeEventListener("loadedmetadata", syncOnce);
+      audio.removeEventListener("pause", onPauseOrEnd);
+      audio.removeEventListener("ended", onPauseOrEnd);
+      audio.removeEventListener("seeked", onInstantSync);
+      audio.removeEventListener("loadedmetadata", onInstantSync);
     };
-  }, [audioRef, lines, offsetMs, song.id]);
+  }, [audioRef, lines, lineWordsMap, offsetMs, song.id]);
 
-  // Smooth auto-scroll to active line or active mid-song interlude
+  // Pause auto-glide gently for 3.5s whenever user manually scrolls with mouse/touch
   useEffect(() => {
     const container = stageRef.current;
-    const targetEl =
-      interlude && interlude.kind === "interlude" && interludeRef.current
-        ? interludeRef.current
-        : activeLineRef.current;
-    if (!container || !targetEl) return;
-    const targetTop = targetEl.offsetTop - container.clientHeight * 0.36 + targetEl.clientHeight / 2;
-    container.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
-  }, [activeIdx, interlude?.kind, interlude?.anchorIndex]);
+    if (!container) return;
+    const pauseAutoGlide = () => {
+      manualScrollUntilRef.current = performance.now() + 3500;
+    };
+    container.addEventListener("wheel", pauseAutoGlide, { passive: true });
+    container.addEventListener("touchstart", pauseAutoGlide, { passive: true });
+    return () => {
+      container.removeEventListener("wheel", pauseAutoGlide);
+      container.removeEventListener("touchstart", pauseAutoGlide);
+    };
+  }, [lines.length]);
 
   async function persist(
     nextText: string,
     nextOffset: number,
     nextSource: "manual" | "lrclib" | "sidecar"
   ) {
-    const saved = await saveLyrics(song.id, {
-      lrc_text: nextText,
-      offset_ms: nextOffset,
-      source: nextSource,
-    });
-    setLrcText(saved.lrc_text);
-    setOffsetMs(saved.offset_ms);
-    setSource(saved.source);
-    setSyncReady(saved.synchronized_ready);
-    if (saved.synchronized_ready) {
-      onLyricsSyncedRef.current?.(song.id);
+    setSaving(true);
+    try {
+      const saved = await saveLyrics(song.id, {
+        lrc_text: nextText,
+        offset_ms: nextOffset,
+        source: nextSource,
+      });
+      setLrcText(saved.lrc_text);
+      setOffsetMs(saved.offset_ms);
+      setSource(saved.source);
+      setSyncReady(saved.synchronized_ready);
+      setMsg("Lyrics saved.");
+      if (saved.synchronized_ready) onLyricsSyncedRef.current?.(song.id);
+      return true;
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : "Could not save lyrics. Please try again.");
+      return false;
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -324,7 +400,7 @@ export function LyricsPanel({
     try {
       const res = await lookupLyrics(song.id);
       if (res.found && res.synced_lyrics) {
-        await persist(res.synced_lyrics, offsetMs, "lrclib");
+        if (!(await persist(res.synced_lyrics, offsetMs, "lrclib"))) return;
         setEditing(false);
         setMsg("Synced lyrics loaded from LRCLIB.");
       } else {
@@ -338,12 +414,13 @@ export function LyricsPanel({
   function seekToLine(startMs: number) {
     const audio = audioRef.current;
     if (!audio) return;
+    manualScrollUntilRef.current = 0;
     audio.currentTime = Math.max(0, (startMs + offsetMs) / 1000);
   }
 
   const sizeClass = tvMode
-    ? "text-[26px] sm:text-[32px] lg:text-[38px]"
-    : "text-[23px] sm:text-[28px] lg:text-[34px]";
+    ? "text-[28px] sm:text-[34px] lg:text-[42px]"
+    : "text-[24px] sm:text-[29px] lg:text-[35px]";
 
   const romanSizeClass = tvMode
     ? "text-[16px] sm:text-[19px] lg:text-[22px]"
@@ -355,8 +432,8 @@ export function LyricsPanel({
         <div
           ref={stageRef}
           aria-live="polite"
-          className={`lyrics-mask thin-scroll relative overflow-y-auto px-2 py-24 sm:px-4 lg:px-8 ${
-            tvMode ? "h-[62vh] lg:h-[82vh]" : "h-[440px] lg:h-[72vh]"
+          className={`lyrics-mask thin-scroll relative overflow-y-auto px-2 py-28 sm:px-4 lg:px-8 ${
+            tvMode ? "h-[64dvh] lg:h-[78dvh]" : "h-[380px] lg:h-[62dvh]"
           }`}
         >
           {/* Intro Countdown Dots */}
@@ -372,7 +449,6 @@ export function LyricsPanel({
               const isExplicitInterlude =
                 blankCue && interlude?.kind === "interlude" && interlude.anchorIndex === i;
 
-              // Explicit blank LRC cue line only expands into breather dots when active
               if (blankCue) {
                 if (!isExplicitInterlude) return null;
                 return (
@@ -386,24 +462,21 @@ export function LyricsPanel({
                 interlude?.kind === "interlude" && interlude.anchorIndex === i;
               const isActive = i === activeIdx && !showTrailingInterlude;
               const isPast = activeIdx >= 0 && (i < activeIdx || showTrailingInterlude);
+              const dist = activeIdx >= 0 ? i - activeIdx : i;
 
-              const toneClass = isActive
-                ? "text-white font-bold"
+              // Apple Music depth cascade: active crisp & 1.0x, upcoming softens gently with distance
+              const depthStyle: React.CSSProperties = isActive
+                ? { transform: "scale(1)", opacity: 1, filter: "none" }
                 : isPast
-                  ? "text-white/30 font-semibold hover:text-white/75"
-                  : "text-white/44 font-semibold hover:text-white/85";
-
-              const activeSweepStyle = isActive
-                ? ({
-                    "--sweep": "100%",
-                    backgroundImage:
-                      "linear-gradient(90deg, #FFFFFF 0%, #FFFFFF var(--sweep, 100%), rgba(255, 255, 255, 0.56) calc(var(--sweep, 100%) + 12%), rgba(255, 255, 255, 0.56) 100%)",
-                    WebkitBackgroundClip: "text",
-                    WebkitTextFillColor: "transparent",
-                  } as React.CSSProperties)
-                : undefined;
+                  ? { transform: "scale(0.965)", opacity: 0.24, filter: "blur(0.6px)" }
+                  : dist === 1
+                    ? { transform: "scale(0.975)", opacity: 0.48, filter: "none" }
+                    : dist === 2
+                      ? { transform: "scale(0.962)", opacity: 0.34, filter: "blur(0.4px)" }
+                      : { transform: "scale(0.95)", opacity: 0.22, filter: "blur(0.85px)" };
 
               const romanLine = romanizedSyncLines?.[i];
+              const words = lineWordsMap[i];
 
               return (
                 <div key={`${line.startMs}-${i}`} className="space-y-5">
@@ -411,19 +484,27 @@ export function LyricsPanel({
                     ref={isActive ? activeLineRef : undefined}
                     type="button"
                     onClick={() => seekToLine(line.startMs)}
-                    className={`block w-full text-left leading-[1.28] tracking-[-0.015em] transition-colors duration-150 ${sizeClass} ${toneClass}`}
+                    style={depthStyle}
+                    className={`lyric-line block w-full text-left leading-[1.26] tracking-[-0.018em] ${sizeClass} ${
+                      isActive ? "font-bold text-white" : "font-semibold text-white"
+                    }`}
                   >
-                    <span style={activeSweepStyle} className="block">
-                      {line.text}
+                    <span className="block">
+                      {isActive && words && words.length > 0
+                        ? words.map((w, wIdx) => (
+                            <span key={wIdx}>
+                              <span data-word-idx={wIdx} data-state="upcoming" className="lyric-word">
+                                {w.text}
+                              </span>
+                              {w.trailingSpace}
+                            </span>
+                          ))
+                        : line.text}
                     </span>
                     {romanLine && romanLine !== line.text && (
                       <span
-                        className={`mt-1 block font-medium leading-[1.35] tracking-normal transition-colors duration-150 ${romanSizeClass} ${
-                          isActive
-                            ? "text-white/85"
-                            : isPast
-                              ? "text-white/22"
-                              : "text-white/35"
+                        className={`mt-1 block font-medium leading-[1.35] tracking-normal transition-colors duration-200 ${romanSizeClass} ${
+                          isActive ? "text-white/85" : "text-white/55"
                         }`}
                       >
                         {romanLine}
@@ -444,7 +525,7 @@ export function LyricsPanel({
       ) : plainLines.length > 0 ? (
         <div
           className={`lyrics-mask thin-scroll relative overflow-y-auto px-2 py-16 sm:px-4 lg:px-8 ${
-            tvMode ? "h-[62vh] lg:h-[82vh]" : "h-[440px] lg:h-[72vh]"
+            tvMode ? "h-[64dvh] lg:h-[78dvh]" : "h-[380px] lg:h-[62dvh]"
           }`}
         >
           {autoFetching && (
@@ -520,13 +601,13 @@ export function LyricsPanel({
 
       {/* Discreet Hover-Revealed Calibration & Editor Bar */}
       <div
-        className={`mt-2 space-y-2.5 lg:px-8 transition-opacity duration-200 ${
+        className={`lyrics-dock mt-2 space-y-2.5 transition-opacity duration-200 lg:px-8 ${
           editing || showSyncDock || msg || autoFetching
             ? "opacity-100"
             : "opacity-0 group-hover/lyrics:opacity-100 focus-within:opacity-100"
         }`}
       >
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-full border border-white/12 bg-black/45 px-3.5 py-1.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-full border border-white/12 bg-black/45 px-3.5 py-1.5 backdrop-blur-md">
           <div className="flex items-center gap-2 text-[11px] text-white/70">
             <span className="sr-only">Lyrics</span>
             <span
@@ -555,11 +636,12 @@ export function LyricsPanel({
               <button
                 key={step}
                 type="button"
+                disabled={saving}
                 onClick={() => {
                   setShowSyncDock(true);
                   void adjustOffset(step);
                 }}
-                className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white"
+                className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white disabled:opacity-40"
               >
                 {step > 0
                   ? `+${step === 1000 ? "1s" : `${step}ms`}`
@@ -570,8 +652,9 @@ export function LyricsPanel({
             ))}
             <button
               type="button"
+              disabled={saving}
               onClick={() => void adjustOffset(0)}
-              className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white"
+              className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white disabled:opacity-40"
             >
               Reset
             </button>
@@ -586,7 +669,7 @@ export function LyricsPanel({
         </div>
 
         {editing && (
-          <div className="space-y-3 rounded-2xl border border-white/15 bg-black/70 p-4">
+          <div className="space-y-3 rounded-2xl border border-white/15 bg-black/75 p-4 backdrop-blur-xl">
             <textarea
               aria-label="Timed LRC lyrics editor"
               value={lrcText}
@@ -598,13 +681,19 @@ export function LyricsPanel({
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => void persist(lrcText, offsetMs, "manual").then(() => setEditing(false))}
+                disabled={saving}
+                onClick={() =>
+                  void persist(lrcText, offsetMs, "manual").then((ok) => {
+                    if (ok) setEditing(false);
+                  })
+                }
                 className="btn-light px-4 py-1.5 text-xs"
               >
-                Save LRC
+                {saving ? "Saving…" : "Save LRC"}
               </button>
               <button
                 type="button"
+                disabled={saving}
                 onClick={() => void handleLookup()}
                 className="btn-ghost px-4 py-1.5 text-xs"
               >
