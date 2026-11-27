@@ -17,24 +17,20 @@ export function SyncStatusBadge({
   const config =
     state === "subscribed"
       ? {
-          dot: "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]",
           text: compact ? "Live" : `${prefix}Live`,
-          tone: "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
+          tone: "border-white/14 bg-white/[0.06] text-white/80",
         }
       : state === "connecting"
         ? {
-            dot: "bg-amber-400 animate-pulse",
             text: "Connecting",
-            tone: "border-amber-400/30 bg-amber-400/10 text-amber-300",
+            tone: "border-white/12 bg-white/[0.04] text-white/55",
           }
         : state === "disconnected"
           ? {
-              dot: "bg-pink",
               text: "Reconnecting",
               tone: "border-pink/35 bg-pink/10 text-pink",
             }
           : {
-              dot: "bg-snow/35",
               text: compact ? "Standby" : `${prefix}Standby`,
               tone: "border-white/10 bg-white/[0.04] text-snow/55",
             };
@@ -43,9 +39,8 @@ export function SyncStatusBadge({
     <span
       role="status"
       aria-label={`Sync status: ${config.text}`}
-      className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] ${config.tone}`}
+      className={`inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] ${config.tone}`}
     >
-      <span className={`h-1.5 w-1.5 rounded-full ${config.dot}`} />
       <span>{config.text}</span>
     </span>
   );

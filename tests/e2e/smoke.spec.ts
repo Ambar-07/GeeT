@@ -38,9 +38,8 @@ test("home join flow and host console local playback + backup", async ({ page })
   fs.writeFileSync(path.join(musicDir, "e2e_track.lrc"), "[00:00.00]E2E Sync Line\n", "utf8");
 
   await page.goto("/host");
-  await expect(page.getByText(/Connected • \d+ songs/)).toBeVisible();
-
   await page.getByRole("button", { name: "Library & settings" }).click();
+  await expect(page.getByRole("button", { name: "Backup DB" })).toBeEnabled();
   await page.getByLabel("Local music folder path").fill(musicDir);
   await page.getByRole("button", { name: "Add & Scan" }).click();
   await expect(page.getByText(/Imported \d+ tracks\./)).toBeVisible();
@@ -69,9 +68,8 @@ test("LAN Party Room guest queue, live sync status, reactions, and TV stage over
   const hostPage = await hostContext.newPage();
 
   await hostPage.goto("/host");
-  await expect(hostPage.getByText(/Connected • \d+ songs/)).toBeVisible();
-
   await hostPage.getByRole("button", { name: "Library & settings" }).click();
+  await expect(hostPage.getByRole("button", { name: "Backup DB" })).toBeEnabled();
   await hostPage.getByLabel("Local music folder path").fill(musicDir);
   await hostPage.getByRole("button", { name: "Add & Scan" }).click();
   await expect(hostPage.getByText(/Imported \d+ tracks\./)).toBeVisible();

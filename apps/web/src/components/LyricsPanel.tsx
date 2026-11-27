@@ -613,11 +613,6 @@ export function LyricsPanel({
               onClick={() => void adjustOffset(0)}
               className="flex h-7 min-w-[66px] items-center justify-center gap-1.5 rounded-full px-2 font-mono text-[11px] text-white/80 transition hover:bg-white/10 disabled:cursor-default disabled:hover:bg-transparent"
             >
-              <span
-                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  autoFetching ? "animate-pulse bg-white" : syncReady ? "bg-emerald-400" : "bg-pink"
-                }`}
-              />
               <span>
                 {autoFetching
                   ? "Syncing"

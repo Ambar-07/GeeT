@@ -927,14 +927,12 @@ export function HostPage() {
               }}
               className="flex items-center gap-2 font-semibold text-[#ff7a98] hover:text-white"
             >
-              <span className="h-2 w-2 animate-ping rounded-full bg-[#fa2d48]" />
               <span>Phone Mic Active — Click to Enable Speaker Audio</span>
             </button>
           ) : (
             <>
-              <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
               <span className="font-medium text-white/90">
-                Phone Mic Live{phoneMicMode === "webrtc" ? " · Direct" : ""}
+                Phone Mic{phoneMicMode === "webrtc" ? " · Direct" : ""}
               </span>
               <button
                 type="button"
@@ -952,27 +950,20 @@ export function HostPage() {
         </div>
       )}
 
-      {/* Minimalist Top Bar (hidden in TV Stage Mode so the stage goes truly full-bleed) */}
+      {/* Clean Minimal Top Bar (hidden in TV Stage Mode) */}
       {!tvMode && (
-        <header className="relative z-30 flex shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] bg-ink-950/90 px-4 py-2.5 backdrop-blur-xl sm:px-5">
+        <header className="relative z-30 flex h-12 shrink-0 items-center justify-between gap-4 border-b border-white/[0.06] bg-ink-950/90 px-4 backdrop-blur-xl sm:px-5">
           <Link to="/" className="shrink-0">
-            <Logo size={30} suffix="Studio" />
+            <Logo size={24} />
           </Link>
 
-          <div className="hidden items-center gap-2 text-xs sm:flex">
-            {health ? (
-              <span role="status" className="flex items-center gap-2 font-medium text-white/55">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]" />
-                Connected • {health.song_count} songs
-              </span>
-            ) : (
-              <span role="status" title={healthError ?? undefined} className="text-rose-300">
-                {healthError ? "Host offline" : "Connecting…"}
+          <div className="flex items-center gap-2.5 text-xs">
+            {healthError && (
+              <span role="status" title={healthError} className="hidden text-[11px] text-rose-300/85 sm:inline">
+                Host offline
               </span>
             )}
-          </div>
 
-          <div className="flex items-center gap-2 text-xs">
             <div ref={settingsRef} className="relative">
               <button
                 type="button"
@@ -980,20 +971,20 @@ export function HostPage() {
                 aria-expanded={settingsOpen}
                 title="Library & Settings"
                 onClick={() => setSettingsOpen((v) => !v)}
-                className={`flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                className={`flex h-7 w-7 items-center justify-center rounded-full transition ${
                   settingsOpen
-                    ? "border-white/25 bg-white/14 text-white"
-                    : "border-white/10 bg-white/[0.05] text-white/70 hover:bg-white/10 hover:text-white"
+                    ? "bg-white/14 text-white"
+                    : "text-white/55 hover:bg-white/[0.08] hover:text-white"
                 }`}
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
                   <circle cx="12" cy="12" r="3" />
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.66 0-1.25.4-1.51 1Z" />
                 </svg>
               </button>
 
               {settingsOpen && (
-                <div className="settings-popover absolute right-0 top-12 z-50 w-80 space-y-3.5 rounded-2xl border border-white/14 bg-ink-900 p-5 shadow-[0_24px_60px_rgba(0,0,0,0.65)]">
+                <div className="settings-popover absolute right-0 top-10 z-50 w-80 space-y-3.5 rounded-2xl border border-white/14 bg-ink-900 p-5 shadow-[0_24px_60px_rgba(0,0,0,0.65)]">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-white">Library & Settings</span>
                     <button
@@ -1112,14 +1103,15 @@ export function HostPage() {
 
             <button
               type="button"
+              aria-label="TV Stage Mode"
               onClick={() => {
                 setSettingsOpen(false);
                 setTvMode(true);
               }}
-              className="btn-primary px-4 py-1.5 text-xs"
+              className="inline-flex h-7 items-center rounded-full bg-white/[0.1] px-3 text-[11px] font-medium text-white/90 transition hover:bg-white hover:text-ink-950"
               title="Enter Full-Screen TV Stage Mode (T)"
             >
-              TV Stage Mode
+              TV Stage
             </button>
           </div>
         </header>
@@ -1181,9 +1173,6 @@ export function HostPage() {
                   : "text-white/60 hover:text-white"
               }`}
             >
-              {stageRoom?.active && (
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              )}
               <span>Party</span>
               {stageRoom?.active && stageRoom.queueCount > 0 && (
                 <span
@@ -1644,7 +1633,7 @@ export function HostPage() {
                       title="Audio, Vocal & Live Mic options"
                     >
                       {micEnabled && (
-                        <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.9)]" />
+                        <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-white" />
                       )}
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                         <circle cx="5" cy="12" r="2" />
@@ -1853,12 +1842,11 @@ export function HostPage() {
 
                 {/* Quick Live Mic Indicator Pill (one-tap off when mic is live and menu is closed) */}
                 {micEnabled && !stemMenuOpen && (
-                  <div className="flex items-center gap-2.5 rounded-full border border-emerald-400/25 bg-black/38 px-3.5 py-1.5 backdrop-blur-md">
-                    <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]" />
+                  <div className="flex items-center gap-2.5 rounded-full border border-white/15 bg-black/38 px-3.5 py-1.5 backdrop-blur-md">
                     <span className="text-[11px] font-medium text-white/85">Live Mic</span>
                     <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/15" aria-hidden="true">
                       <div
-                        className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                        className="h-full rounded-full bg-white/85 transition-[width] duration-75"
                         style={{ width: `${Math.round(micLevel * 100)}%` }}
                       />
                     </div>
@@ -1944,14 +1932,7 @@ export function HostPage() {
                     {/* Live Mic + Studio Reverb Controls */}
                     <div className="space-y-2.5 border-t border-white/10 pt-3">
                       <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`h-1.5 w-1.5 rounded-full ${
-                              micEnabled ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.9)]" : "bg-white/30"
-                            }`}
-                          />
-                          <span className="text-xs font-medium text-white/90">Live Mic & Reverb</span>
-                        </div>
+                        <span className="text-xs font-medium text-white/90">Live Mic & Reverb</span>
                         <button
                           type="button"
                           role="switch"
@@ -1960,7 +1941,7 @@ export function HostPage() {
                           onClick={() => void toggleLiveMic()}
                           className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
                             micEnabled
-                              ? "bg-emerald-400 text-ink-950"
+                              ? "bg-white text-ink-950"
                               : "bg-white/10 text-white/75 hover:bg-white/18 hover:text-white"
                           }`}
                         >
@@ -1972,7 +1953,7 @@ export function HostPage() {
                         <div className="space-y-2">
                           <div className="h-1 w-full overflow-hidden rounded-full bg-white/12" aria-hidden="true">
                             <div
-                              className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                              className="h-full rounded-full bg-white/85 transition-[width] duration-75"
                               style={{ width: `${Math.round(micLevel * 100)}%` }}
                             />
                           </div>

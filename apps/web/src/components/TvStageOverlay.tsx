@@ -99,8 +99,7 @@ export function TvStageOverlay({
             className="rounded-full ring-1 ring-white/20"
           />
           <div className="min-w-0">
-            <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#ff6b8b]">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#fa2d48]" />
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#ff6b8b]">
               Now on Stage · {currentSinger.singer}
             </p>
             <p className="truncate text-xs font-bold text-white">
@@ -147,7 +146,6 @@ export function TvStageOverlay({
             tvMode ? "right-28 top-5" : "right-5 top-4"
           }`}
         >
-          <span className="h-2 w-2 animate-pulse rounded-full bg-[#fa2d48]" />
           <span className="max-w-[240px] truncate">
             Preparing: {displayTitle(autoPreparingTitle)}
             {autoPrepareProgress !== null ? ` (${autoPrepareProgress}%)` : ""}

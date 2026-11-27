@@ -636,9 +636,8 @@ export function RoomPage() {
           >
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <span className="h-2 w-2 animate-ping rounded-full bg-[#fa2d48]" />
                 <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-[#ff7a98]">
-                  You&apos;re On Stage Now! 🎤
+                  You&apos;re On Stage Now!
                 </span>
               </div>
               <p className="mt-0.5 truncate font-semibold text-white">
@@ -666,10 +665,7 @@ export function RoomPage() {
             }`}
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[#ff7a98]">
-                {myNextQueueIdx === 0 && (
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-[#fa2d48]" />
-                )}
+              <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-[#ff7a98]">
                 {myNextQueueIdx === 0
                   ? "You're Up Next!"
                   : `Your Turn: #${myNextQueueIdx + 1} in queue`}
@@ -799,16 +795,7 @@ export function RoomPage() {
           <section className="space-y-2.5 rounded-2xl border border-white/12 bg-black/38 p-3.5 backdrop-blur-xl sm:px-4">
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
-                <p className="flex items-center gap-2 text-xs font-semibold text-white">
-                  <span
-                    className={`h-2 w-2 rounded-full ${
-                      phoneMicOn
-                        ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]"
-                        : "bg-white/30"
-                    }`}
-                  />
-                  <span>Wireless Phone Mic</span>
-                </p>
+                <p className="text-xs font-semibold text-white">Wireless Phone Mic</p>
                 <p className="mt-0.5 text-[11px] text-white/50">
                   {phoneMicOn
                     ? connState !== "subscribed"
@@ -829,7 +816,7 @@ export function RoomPage() {
                 onClick={() => void togglePhoneMic()}
                 className={`shrink-0 rounded-full px-4 py-2 text-xs font-semibold transition ${
                   phoneMicOn
-                    ? "bg-emerald-400 text-ink-950"
+                    ? "bg-white text-ink-950"
                     : "btn-primary px-4 py-2 text-xs"
                 }`}
               >
@@ -839,7 +826,7 @@ export function RoomPage() {
             {phoneMicOn && (
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/12" aria-hidden="true">
                 <div
-                  className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                  className="h-full rounded-full bg-white/85 transition-[width] duration-75"
                   style={{ width: `${Math.round(phoneMicLevel * 100)}%` }}
                 />
               </div>
