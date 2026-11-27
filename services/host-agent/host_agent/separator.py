@@ -1,14 +1,27 @@
+from __future__ import annotations
+
+import contextlib
 import importlib.util
-import re
+import os
 import shutil
 import subprocess
-import sys
-import time
+import threading
 import wave
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-PROGRESS_RE = re.compile(r"(\d{1,3})%\|")
+import numpy as np
+
+DEFAULT_MODEL_NAME = os.getenv("GEET_DEMUCS_MODEL", "htdemucs").strip() or "htdemucs"
+DEFAULT_OVERLAP = float(os.getenv("GEET_DEMUCS_OVERLAP", "0.1"))
+DEFAULT_SHIFTS = int(os.getenv("GEET_DEMUCS_SHIFTS", "0"))
+
+_MODEL_LOCK = threading.Lock()
+_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+
+class _SeparationCancelled(RuntimeError):
+    pass
 
 
 def find_ffmpeg() -> str | None:
@@ -68,18 +81,15 @@ def verify_stem_integrity(stem_path: Path, expected_duration_ms: int = 0) -> Non
             )
 
 
-def _decode_to_stereo_wav(source_path: Path, tmp_dir: Path) -> Path:
-    """Pre-decode ALAC/EC-3/M4A/FLAC/MP3 to standard 44.1kHz stereo WAV via bundled ffmpeg."""
-    if source_path.suffix.lower() == ".wav":
-        return source_path
+def _decode_to_float32_stereo(source_path: Path, sample_rate: int = 44100) -> np.ndarray:
+    """Decode any audio file directly to an in-memory (2, N) float32 array via FFmpeg pipe."""
     ffmpeg_exe = find_ffmpeg()
     if not ffmpeg_exe:
-        raise RuntimeError("FFmpeg is required to decode non-WAV audio for separation")
-    wav_in = tmp_dir / "input.wav"
+        raise RuntimeError("FFmpeg is required to decode audio for separation")
+
     proc = subprocess.run(
         [
             ffmpeg_exe,
-            "-y",
             "-v",
             "error",
             "-i",
@@ -88,18 +98,91 @@ def _decode_to_stereo_wav(source_path: Path, tmp_dir: Path) -> Path:
             "-ac",
             "2",
             "-ar",
-            "44100",
-            "-c:a",
-            "pcm_s16le",
-            str(wav_in),
+            str(sample_rate),
+            "-f",
+            "f32le",
+            "pipe:1",
         ],
         capture_output=True,
-        text=True,
         timeout=120,
     )
-    if proc.returncode != 0 or not wav_in.is_file() or wav_in.stat().st_size <= 44:
-        raise RuntimeError(f"FFmpeg decode failed: {proc.stderr.strip()[-240:]}")
-    return wav_in
+    if proc.returncode != 0 or len(proc.stdout) < 8:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"FFmpeg decode failed: {err[-240:]}")
+
+    frame_bytes = (len(proc.stdout) // 8) * 8
+    interleaved = np.frombuffer(proc.stdout[:frame_bytes], dtype="<f4").reshape(-1, 2)
+    return np.ascontiguousarray(interleaved.T, dtype=np.float32)
+
+
+def _write_stereo_wav(path: Path, audio_2ch: np.ndarray, sample_rate: int = 44100) -> None:
+    """Write a (2, N) float32 array cleanly to a 16-bit PCM stereo WAV file."""
+    clipped = np.clip(audio_2ch, -1.0, 1.0)
+    pcm16 = np.rint(clipped.T * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm16.tobytes())
+
+
+def _get_cached_model(model_name: str, device: str) -> Any:
+    """Load Demucs model once per (model, device) and keep weights warm in memory/VRAM."""
+    key = (model_name, device)
+    with _MODEL_LOCK:
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        import torch
+        from demucs.pretrained import get_model
+
+        if device == "cuda" and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+        elif device == "cpu":
+            cores = os.cpu_count() or 4
+            torch.set_num_threads(max(1, min(cores, 8)))
+
+        model = get_model(model_name)
+        model.eval()
+        model.to(device)
+        _MODEL_CACHE[key] = model
+        return model
+
+
+def _run_apply_model(
+    model: Any,
+    norm_mix: Any,
+    device: str,
+    overlap: float,
+    shifts: int,
+    segment: float | None,
+    callback: Callable[[dict[str, Any]], None],
+    audio_length: int,
+) -> Any:
+    import torch
+    from demucs.apply import apply_model
+
+    amp_ctx = (
+        torch.amp.autocast("cuda", dtype=torch.float16)
+        if device == "cuda"
+        else contextlib.nullcontext()
+    )
+    with torch.inference_mode(), amp_ctx:
+        return apply_model(
+            model,
+            norm_mix,
+            shifts=shifts,
+            split=True,
+            overlap=overlap,
+            device=device,
+            num_workers=0,
+            segment=segment,
+            progress=False,
+            callback=callback,
+            callback_arg={"audio_length": audio_length},
+        )
 
 
 def run_demucs_separation(
@@ -109,68 +192,114 @@ def run_demucs_separation(
     cancel_check: Callable[[], bool],
     progress_cb: Callable[[int], None] | None = None,
 ) -> tuple[Path, Path]:
-    """Run local Demucs two-stem vocal separation into tmp_dir and return (instrumental, vocal)."""
+    """Run warm in-process Demucs two-stem vocal separation and return (instrumental, vocal)."""
     if not has_demucs():
         raise RuntimeError("Demucs is not installed on this host")
+    if cancel_check():
+        raise RuntimeError("Cancelled")
 
-    input_wav = _decode_to_stereo_wav(source_path, tmp_dir)
+    import torch
+
+    model = _get_cached_model(DEFAULT_MODEL_NAME, device)
+    sample_rate = int(getattr(model, "samplerate", 44100))
     if cancel_check():
         raise RuntimeError("Cancelled")
     if progress_cb:
-        progress_cb(20)
+        progress_cb(15)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "demucs.separate",
-        "--two-stems=vocals",
-        "-d",
-        device,
-        "-o",
-        str(tmp_dir),
-        str(input_wav),
-    ]
-    import threading
+    wav_np = _decode_to_float32_stereo(source_path, sample_rate=sample_rate)
+    if cancel_check():
+        raise RuntimeError("Cancelled")
+    if progress_cb:
+        progress_cb(22)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    stderr_buf: list[str] = []
+    audio_length = int(wav_np.shape[1])
+    wav = torch.from_numpy(wav_np)
+    ref = wav.mean(0)
+    mean = ref.mean()
+    std = ref.std() + 1e-8
+    norm_mix = ((wav - mean) / std).unsqueeze(0)
 
-    def _drain_stderr() -> None:
-        if not proc.stderr:
-            return
-        buf = ""
-        while True:
-            chunk = proc.stderr.read(128)
-            if not chunk:
-                break
-            text = chunk.decode("utf-8", errors="replace")
-            stderr_buf.append(text)
-            buf = (buf + text)[-256:]
-            matches = PROGRESS_RE.findall(buf)
-            if matches and progress_cb:
-                progress_cb(min(95, 20 + int(int(matches[-1]) * 0.75)))
+    last_pct = 22
 
-    reader = threading.Thread(target=_drain_stderr, daemon=True)
-    reader.start()
-
-    while proc.poll() is None:
+    def _on_segment(info: dict[str, Any]) -> None:
+        nonlocal last_pct
         if cancel_check():
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            raise _SeparationCancelled("Cancelled")
+        if not progress_cb:
+            return
+        total = max(1, int(info.get("audio_length") or audio_length))
+        offset = int(info.get("segment_offset") or 0)
+        models_count = max(1, int(info.get("models") or 1))
+        model_idx = int(info.get("model_idx_in_bag") or 0)
+        # Estimate fraction across segments & sub-models
+        seg_frac = min(1.0, offset / total)
+        if info.get("state") == "end":
+            seg_frac = min(1.0, seg_frac + 0.08)
+        overall = (model_idx + seg_frac) / models_count
+        pct = min(93, 22 + int(overall * 71))
+        if pct > last_pct:
+            last_pct = pct
+            progress_cb(pct)
+
+    overlap = max(0.05, min(0.5, DEFAULT_OVERLAP))
+    shifts = max(0, DEFAULT_SHIFTS)
+
+    try:
+        try:
+            out = _run_apply_model(
+                model,
+                norm_mix,
+                device=device,
+                overlap=overlap,
+                shifts=shifts,
+                segment=None,
+                callback=_on_segment,
+                audio_length=audio_length,
+            )
+        except _SeparationCancelled:
             raise RuntimeError("Cancelled")
-        time.sleep(0.25)
+        except RuntimeError as exc:
+            # Handle 4-6GB laptop GPU OOM cleanly by retrying with smaller segment before CPU fallback
+            if device == "cuda" and "out of memory" in str(exc).lower():
+                torch.cuda.empty_cache()
+                try:
+                    out = _run_apply_model(
+                        model,
+                        norm_mix,
+                        device="cuda",
+                        overlap=overlap,
+                        shifts=0,
+                        segment=5.0,
+                        callback=_on_segment,
+                        audio_length=audio_length,
+                    )
+                except _SeparationCancelled:
+                    raise RuntimeError("Cancelled")
+            else:
+                raise
+    finally:
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    reader.join(timeout=2)
+    if cancel_check():
+        raise RuntimeError("Cancelled")
 
-    if proc.returncode != 0:
-        err = "".join(stderr_buf).strip()
-        raise RuntimeError(f"Demucs failed (exit {proc.returncode}): {err[-300:]}")
+    stems = (out[0].float().cpu() * std + mean).numpy()
+    sources = list(model.sources)
+    if "vocals" not in sources:
+        raise RuntimeError(f"Demucs model {DEFAULT_MODEL_NAME} has no vocals stem")
 
-    inst_matches = list(tmp_dir.rglob("no_vocals.wav"))
-    voc_matches = list(tmp_dir.rglob("vocals.wav"))
-    if not inst_matches or not voc_matches:
-        raise RuntimeError("Demucs finished without expected stem files")
-    return inst_matches[0], voc_matches[0]
+    voc_idx = sources.index("vocals")
+    vocals = stems[voc_idx]
+    no_vocals = np.sum(np.delete(stems, voc_idx, axis=0), axis=0)
+
+    if progress_cb:
+        progress_cb(96)
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    inst_path = tmp_dir / "no_vocals.wav"
+    voc_path = tmp_dir / "vocals.wav"
+    _write_stereo_wav(inst_path, no_vocals, sample_rate=sample_rate)
+    _write_stereo_wav(voc_path, vocals, sample_rate=sample_rate)
+    return inst_path, voc_path

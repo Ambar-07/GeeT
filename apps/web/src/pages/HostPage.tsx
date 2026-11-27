@@ -17,7 +17,9 @@ import {
   type UpNextItem,
 } from "../components/HostRoomPanel";
 import { LyricsPanel } from "../components/LyricsPanel";
-import { TvStageOverlay } from "../components/TvStageOverlay";
+import { TvStageOverlay, type EncoreTransitionState } from "../components/TvStageOverlay";
+import { LiveMicEngine, RemoteMicReceiver } from "../lib/liveMic";
+import type { HostRemoteCommand, MicRtcSignal } from "../lib/rooms";
 import {
   backupMetadata,
   cancelJob,
@@ -133,6 +135,16 @@ export function HostPage() {
 
   const [stageRoom, setStageRoom] = useState<HostStageRoomInfo | null>(null);
   const [reactionBursts, setReactionBursts] = useState<StageReactionBurst[]>([]);
+  const [encoreState, setEncoreState] = useState<{
+    finishedTitle: string;
+    finishedSinger: string | null;
+    reactionCount: number;
+    nextItem: UpNextItem;
+    secondsLeft: number;
+  } | null>(null);
+  const songReactionCountRef = useRef(0);
+  const stageRoomRef = useRef<HostStageRoomInfo | null>(null);
+  stageRoomRef.current = stageRoom;
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
@@ -143,6 +155,17 @@ export function HostPage() {
   const [repeatOne, setRepeatOne] = useState(false);
   const [vocalMix, setVocalMix] = useState(0.15);
   const [showVocalSlider, setShowVocalSlider] = useState(false);
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [micGain, setMicGain] = useState(1.0);
+  const [micReverb, setMicReverb] = useState(0.28);
+  const [micLevel, setMicLevel] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+  const [phoneMicLive, setPhoneMicLive] = useState(false);
+  const [phoneMicBlocked, setPhoneMicBlocked] = useState(false);
+  const [phoneMicMuted, setPhoneMicMuted] = useState(false);
+  const [phoneMicMode, setPhoneMicMode] = useState<"webrtc" | "ws" | null>(null);
+  const micEngineRef = useRef<LiveMicEngine | null>(null);
+  const remoteMicRef = useRef<RemoteMicReceiver | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const vocalAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -191,11 +214,64 @@ export function HostPage() {
   }, []);
 
   const handleReactionBurst = useCallback((burst: StageReactionBurst) => {
+    songReactionCountRef.current += 1;
     setReactionBursts((prev) => [...prev.slice(-10), burst]);
     setTimeout(() => {
       setReactionBursts((prev) => prev.filter((item) => item.id !== burst.id));
     }, 3400);
   }, []);
+
+  const handleRemoteCommand = useCallback((cmd: HostRemoteCommand) => {
+    if (cmd.action === "toggle_play") {
+      if (!activeSongRef.current) {
+        const room = stageRoomRef.current;
+        if (room?.playNext) {
+          room.playNext();
+        } else if (songsRef.current.length > 0) {
+          selectSongForPlayback(songsRef.current[0]);
+        }
+        return;
+      }
+      togglePlayPause();
+    } else if (cmd.action === "toggle_tv") {
+      setTvMode((v) => !v);
+    } else if (cmd.action === "next") {
+      setEncoreState(null);
+      const room = stageRoomRef.current;
+      if (room?.playNext) {
+        room.playNext();
+      } else {
+        stepLibraryTrack(1);
+      }
+    } else if (cmd.action === "vocal_mix" && typeof cmd.value === "number") {
+      const clamped = Math.max(0, Math.min(1, cmd.value));
+      setVocalMix(clamped);
+      if (activeSongRef.current?.has_instrumental) {
+        setShowVocalSlider(true);
+        if (audioMode !== "instrumental") switchAudioMode("instrumental");
+      }
+    }
+  }, [audioMode]);
+
+  // Reset per-song reaction tally & clear any encore countdown whenever a new song starts
+  useEffect(() => {
+    songReactionCountRef.current = 0;
+    setEncoreState(null);
+  }, [activeSong?.id]);
+
+  // Count down 5 -> 0 during Encore Transition, then auto-start the next queued singer
+  useEffect(() => {
+    if (!encoreState) return;
+    if (encoreState.secondsLeft <= 0) {
+      setEncoreState(null);
+      stageRoomRef.current?.playNext?.();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setEncoreState((prev) => (prev ? { ...prev, secondsLeft: prev.secondsLeft - 1 } : null));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [encoreState]);
 
   const activeSongRef = useRef<HostSong | null>(null);
   activeSongRef.current = activeSong;
@@ -268,6 +344,94 @@ export function HostPage() {
     }, 220);
     return () => clearTimeout(timer);
   }, [query]);
+
+  // Keep live mic & wireless phone mic gain/reverb synced + release hardware cleanly on unmount
+  useEffect(() => {
+    micEngineRef.current?.applyMix(micGain, micReverb);
+    remoteMicRef.current?.applyMix(micGain, micReverb);
+  }, [micGain, micReverb]);
+
+  const handlePhoneMicAudio = useCallback((pcm: ArrayBuffer) => {
+    if (!remoteMicRef.current) remoteMicRef.current = new RemoteMicReceiver();
+    remoteMicRef.current.enqueue(pcm);
+  }, []);
+
+  const handlePhoneMicRtcSignal = useCallback(
+    (signal: MicRtcSignal, sendReply: (reply: MicRtcSignal) => void) => {
+      if (!remoteMicRef.current) remoteMicRef.current = new RemoteMicReceiver();
+      void remoteMicRef.current.handleRtcSignal(signal, sendReply);
+    },
+    []
+  );
+
+  // Pre-unlock Host Web Audio output on user interaction while a Party Room is active
+  useEffect(() => {
+    if (!stageRoom?.active) {
+      setPhoneMicLive(false);
+      setPhoneMicBlocked(false);
+      setPhoneMicMode(null);
+      return;
+    }
+    const unlockHostAudio = () => {
+      if (!remoteMicRef.current) remoteMicRef.current = new RemoteMicReceiver();
+      void remoteMicRef.current.unlock().then((running) => {
+        if (running) setPhoneMicBlocked(false);
+      });
+    };
+    window.addEventListener("pointerdown", unlockHostAudio, { passive: true });
+    window.addEventListener("keydown", unlockHostAudio, { passive: true });
+    const timer = window.setInterval(() => {
+      const rx = remoteMicRef.current;
+      if (!rx) return;
+      const live = rx.isReceiving();
+      setPhoneMicLive(live);
+      setPhoneMicBlocked(live && rx.isSuspended());
+      setPhoneMicMode(rx.getTransportMode());
+    }, 250);
+    return () => {
+      window.removeEventListener("pointerdown", unlockHostAudio);
+      window.removeEventListener("keydown", unlockHostAudio);
+      window.clearInterval(timer);
+    };
+  }, [stageRoom?.active]);
+
+  useEffect(() => {
+    if (!micEnabled) {
+      setMicLevel(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (!document.hidden) {
+        setMicLevel(micEngineRef.current?.getLevel() ?? 0);
+      }
+    }, 65);
+    return () => window.clearInterval(timer);
+  }, [micEnabled]);
+
+  useEffect(() => {
+    return () => {
+      micEngineRef.current?.stop();
+      remoteMicRef.current?.stop();
+    };
+  }, []);
+
+  async function toggleLiveMic() {
+    setMicError(null);
+    if (micEnabled) {
+      micEngineRef.current?.stop();
+      setMicEnabled(false);
+      return;
+    }
+    try {
+      if (!micEngineRef.current) micEngineRef.current = new LiveMicEngine();
+      await micEngineRef.current.start(micGain, micReverb);
+      setMicEnabled(true);
+    } catch (err) {
+      micEngineRef.current?.stop();
+      setMicEnabled(false);
+      setMicError(err instanceof Error ? err.message : "Could not access microphone.");
+    }
+  }
 
   // Keep primary + companion vocal stem audio volumes synced
   useEffect(() => {
@@ -696,6 +860,48 @@ export function HostPage() {
 
   return (
     <div className={`host-shell flex min-h-dvh flex-col bg-ink-950 text-snow lg:h-dvh lg:overflow-hidden ${tvMode ? "is-tv" : ""}`}>
+      {/* Live Wireless Phone Mic Indicator / Autoplay Unlock Pill */}
+      {phoneMicLive && (
+        <div
+          role="status"
+          className="fixed left-1/2 top-3 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/15 bg-ink-950/90 px-3.5 py-1.5 text-xs shadow-[0_10px_30px_rgba(0,0,0,0.55)] backdrop-blur-xl"
+        >
+          {phoneMicBlocked ? (
+            <button
+              type="button"
+              onClick={() => {
+                if (!remoteMicRef.current) remoteMicRef.current = new RemoteMicReceiver();
+                void remoteMicRef.current.unlock().then((ok) => {
+                  if (ok) setPhoneMicBlocked(false);
+                });
+              }}
+              className="flex items-center gap-2 font-semibold text-[#ff7a98] hover:text-white"
+            >
+              <span className="h-2 w-2 animate-ping rounded-full bg-[#fa2d48]" />
+              <span>Phone Mic Active — Click to Enable Speaker Audio</span>
+            </button>
+          ) : (
+            <>
+              <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
+              <span className="font-medium text-white/90">
+                Phone Mic Live{phoneMicMode === "webrtc" ? " · Direct" : ""}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !phoneMicMuted;
+                  setPhoneMicMuted(next);
+                  remoteMicRef.current?.setMuted(next);
+                }}
+                className="rounded-full bg-white/10 px-2.5 py-0.5 text-[11px] font-medium text-white/80 hover:bg-white/20 hover:text-white"
+              >
+                {phoneMicMuted ? "Unmute" : "Mute"}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Minimalist Top Bar (hidden in TV Stage Mode so the stage goes truly full-bleed) */}
       {!tvMode && (
         <header className="relative z-30 flex shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] bg-ink-950/90 px-4 py-2.5 backdrop-blur-xl sm:px-5">
@@ -1163,6 +1369,9 @@ export function HostPage() {
               getPlaybackClock={getPlaybackClock}
               onStageRoomChange={setStageRoom}
               onReactionBurst={handleReactionBurst}
+              onRemoteCommand={handleRemoteCommand}
+              onMicAudio={handlePhoneMicAudio}
+              onMicRtcSignal={handlePhoneMicRtcSignal}
             />
           </div>
         </aside>
@@ -1171,9 +1380,9 @@ export function HostPage() {
         <main
           id="karaoke-stage"
           aria-label="Karaoke Stage"
-          className="karaoke-stage thin-scroll relative isolate flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-5 py-8 sm:px-8 lg:px-10"
+          className="karaoke-stage relative isolate flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
         >
-          {/* Flowing GPU-Composited Album-Adapted Backdrop */}
+          {/* Flowing GPU-Composited Album-Adapted Backdrop (pinned outside scroll container so it never cuts off) */}
           <StageBackdrop
             songId={activeSong?.id}
             hasCover={activeSong?.has_cover}
@@ -1230,8 +1439,21 @@ export function HostPage() {
             hasActiveSong={Boolean(activeSong)}
             autoPreparingTitle={jobIsActive ? autoPrepTitle : null}
             autoPrepareProgress={jobIsActive && activeJob ? Math.round(activeJob.progress) : null}
+            encoreTransition={
+              encoreState
+                ? ({
+                    ...encoreState,
+                    onPlayNow: () => {
+                      setEncoreState(null);
+                      stageRoomRef.current?.playNext?.();
+                    },
+                    onCancel: () => setEncoreState(null),
+                  } satisfies EncoreTransitionState)
+                : null
+            }
           />
 
+          <div className="thin-scroll relative z-10 flex min-h-0 flex-1 flex-col overflow-y-auto px-5 py-8 sm:px-8 lg:px-10">
           {activeSong ? (
             <div
               className={`player-layout relative z-10 mx-auto my-auto grid w-full items-center gap-8 xl:gap-12 ${
@@ -1242,7 +1464,7 @@ export function HostPage() {
             >
               {/* Left Artwork & Refined Centered Transport Pod */}
               <div
-                className={`player-artwork mx-auto w-full space-y-5 ${
+                className={`player-artwork relative mx-auto w-full space-y-5 ${
                   tvMode ? "max-w-[400px]" : "max-w-[330px]"
                 }`}
               >
@@ -1323,11 +1545,14 @@ export function HostPage() {
                       aria-label="Audio stem options"
                       aria-expanded={stemMenuOpen}
                       onClick={() => setStemMenuOpen((v) => !v)}
-                      className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 transition hover:bg-white/20 hover:text-white ${
+                      className={`relative flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 transition hover:bg-white/20 hover:text-white ${
                         stemMenuOpen ? "border-white/30 bg-white/25 text-white" : ""
                       }`}
-                      title="Vocal / Instrumental stem options"
+                      title="Audio, Vocal & Live Mic options"
                     >
+                      {micEnabled && (
+                        <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.9)]" />
+                      )}
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                         <circle cx="5" cy="12" r="2" />
                         <circle cx="12" cy="12" r="2" />
@@ -1533,9 +1758,30 @@ export function HostPage() {
                   </div>
                 )}
 
-                {/* Inline Expandable Audio Stem & Preparation Panel */}
+                {/* Quick Live Mic Indicator Pill (one-tap off when mic is live and menu is closed) */}
+                {micEnabled && !stemMenuOpen && (
+                  <div className="flex items-center gap-2.5 rounded-full border border-emerald-400/25 bg-black/38 px-3.5 py-1.5 backdrop-blur-md">
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]" />
+                    <span className="text-[11px] font-medium text-white/85">Live Mic</span>
+                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/15" aria-hidden="true">
+                      <div
+                        className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                        style={{ width: `${Math.round(micLevel * 100)}%` }}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void toggleLiveMic()}
+                      className="rounded-full bg-white/10 px-2.5 py-0.5 text-[10px] font-medium text-white/80 transition hover:bg-white/20 hover:text-white"
+                    >
+                      Mute Mic
+                    </button>
+                  </div>
+                )}
+
+                {/* Floating Audio Stem & Live Mic Popover (overlays transport so stage height never jumps) */}
                 {stemMenuOpen && (
-                  <div className="space-y-3 rounded-2xl border border-white/14 bg-black/45 p-3.5 backdrop-blur-xl">
+                  <div className="absolute inset-x-0 bottom-12 z-30 space-y-3 rounded-2xl border border-white/18 bg-[#120e1b]/92 p-3.5 shadow-[0_20px_50px_rgba(0,0,0,0.65)] backdrop-blur-2xl">
                     <div
                       className="flex justify-between rounded-full border border-white/10 bg-black/35 p-1 text-[11px]"
                       role="group"
@@ -1599,6 +1845,87 @@ export function HostPage() {
                         >
                           Clear Cache
                         </button>
+                      )}
+                    </div>
+
+                    {/* Live Mic + Studio Reverb Controls */}
+                    <div className="space-y-2.5 border-t border-white/10 pt-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              micEnabled ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.9)]" : "bg-white/30"
+                            }`}
+                          />
+                          <span className="text-xs font-medium text-white/90">Live Mic & Reverb</span>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-label="Live microphone"
+                          aria-checked={micEnabled}
+                          onClick={() => void toggleLiveMic()}
+                          className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
+                            micEnabled
+                              ? "bg-emerald-400 text-ink-950"
+                              : "bg-white/10 text-white/75 hover:bg-white/18 hover:text-white"
+                          }`}
+                        >
+                          {micEnabled ? "On" : "Off"}
+                        </button>
+                      </div>
+
+                      {micEnabled && (
+                        <div className="space-y-2">
+                          <div className="h-1 w-full overflow-hidden rounded-full bg-white/12" aria-hidden="true">
+                            <div
+                              className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                              style={{ width: `${Math.round(micLevel * 100)}%` }}
+                            />
+                          </div>
+                          <div className="flex items-center gap-2.5">
+                            <label htmlFor="live-mic-gain" className="w-12 shrink-0 text-[10px] text-white/60">
+                              Mic Gain
+                            </label>
+                            <input
+                              id="live-mic-gain"
+                              type="range"
+                              min={0}
+                              max={2.0}
+                              step={0.05}
+                              value={micGain}
+                              onChange={(e) => setMicGain(Number(e.target.value))}
+                              className="range h-1 flex-1"
+                            />
+                            <span className="w-8 text-right font-mono text-[10px] text-white/60">
+                              {Math.round(micGain * 100)}%
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2.5">
+                            <label htmlFor="live-mic-reverb" className="w-12 shrink-0 text-[10px] text-white/60">
+                              Reverb
+                            </label>
+                            <input
+                              id="live-mic-reverb"
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={micReverb}
+                              onChange={(e) => setMicReverb(Number(e.target.value))}
+                              className="range h-1 flex-1"
+                            />
+                            <span className="w-8 text-right font-mono text-[10px] text-white/60">
+                              {Math.round(micReverb * 100)}%
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {micError && (
+                        <p role="alert" className="text-[11px] text-[#ff7a98]">
+                          {micError}
+                        </p>
                       )}
                     </div>
                   </div>
@@ -1756,6 +2083,7 @@ export function HostPage() {
               )}
             </div>
           )}
+          </div>
 
           {/* Persistent audio elements stay mounted across idle/stage transitions so tap-to-play unlocks autoplay synchronously */}
           <audio
@@ -1842,6 +2170,16 @@ export function HostPage() {
                 audioRef.current.currentTime = 0;
                 if (vocalAudioRef.current) vocalAudioRef.current.currentTime = 0;
                 void audioRef.current.play().catch(() => {});
+                return;
+              }
+              if (stageRoom?.active && stageRoom.playNext && stageRoom.upNext.length > 0 && activeSong) {
+                setEncoreState({
+                  finishedTitle: activeSong.title,
+                  finishedSinger: stageRoom.currentSinger?.singer ?? null,
+                  reactionCount: songReactionCountRef.current,
+                  nextItem: stageRoom.upNext[0],
+                  secondsLeft: 5,
+                });
                 return;
               }
               emitPlayback("ended");

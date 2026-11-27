@@ -386,3 +386,19 @@ def test_lrclib_search_fallback_cleans_title_and_artist(tmp_path: Path, monkeypa
     res = client.post(f"/songs/{song_id}/lyrics/lookup")
     assert res.status_code == 200
     assert res.json()["found"] is False
+
+
+def test_separator_pipe_decode_and_wav_write(tmp_path: Path):
+    import numpy as np
+    from host_agent.separator import _decode_to_float32_stereo, _write_stereo_wav, verify_stem_integrity
+
+    src = tmp_path / "tone.wav"
+    samples = np.sin(np.linspace(0, 20 * np.pi, 4410, dtype=np.float32))
+    stereo = np.stack([samples, samples * 0.5], axis=0)
+    _write_stereo_wav(src, stereo, sample_rate=44100)
+    verify_stem_integrity(src, expected_duration_ms=100)
+
+    decoded = _decode_to_float32_stereo(src, sample_rate=44100)
+    assert decoded.shape == (2, 4410)
+    assert float(np.max(np.abs(decoded[0]))) > 0.9
+    assert float(np.max(np.abs(decoded[1]))) < 0.6

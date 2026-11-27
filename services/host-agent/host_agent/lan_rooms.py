@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import secrets
 import socket
 import time
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field
 
 ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ALLOWED_REACTIONS = {"Clap", "Encore", "Cheer", "Fire", "Sing", "Love"}
+ALLOWED_REMOTE_ACTIONS = {"toggle_play", "next", "toggle_tv", "vocal_mix"}
 
 
 def _now_iso() -> str:
@@ -566,7 +568,28 @@ def create_lan_router(
             await websocket.send_json({"type": "snapshot", "payload": state.snapshot()})
             await manager.broadcast_presence(state)
             while True:
-                data = await websocket.receive_json()
+                raw_msg = await websocket.receive()
+                if raw_msg.get("type") == "websocket.disconnect":
+                    break
+                pcm_bytes = raw_msg.get("bytes")
+                if pcm_bytes is not None:
+                    # Forward wireless phone mic PCM chunks directly to host speaker WebSocket(s)
+                    if 0 < len(pcm_bytes) <= 16384 and client_uid != state.room["host_user_id"]:
+                        host_uid = state.room["host_user_id"]
+                        for ws_peer, peer_uid in list(state.connections.items()):
+                            if peer_uid == host_uid:
+                                try:
+                                    await ws_peer.send_bytes(pcm_bytes)
+                                except Exception:
+                                    state.connections.pop(ws_peer, None)
+                    continue
+                text_data = raw_msg.get("text")
+                if not text_data:
+                    continue
+                try:
+                    data = json.loads(text_data)
+                except Exception:
+                    continue
                 msg_type = data.get("type")
                 if msg_type == "reaction":
                     label = str(data.get("label") or "Cheer")
@@ -581,6 +604,48 @@ def create_lan_router(
                             state,
                             {"type": "lyrics_sync", "payload": payload},
                         )
+                elif msg_type == "host_control":
+                    cap = str(data.get("capability") or "")
+                    action = str(data.get("action") or "")
+                    if (
+                        cap
+                        and hmac.compare_digest(cap, state.host_capability)
+                        and action in ALLOWED_REMOTE_ACTIONS
+                    ):
+                        out_payload: dict[str, Any] = {"action": action}
+                        if action == "vocal_mix" and isinstance(data.get("value"), (int, float)):
+                            out_payload["value"] = max(0.0, min(1.0, float(data["value"])))
+                        # Strip capability before forwarding so guests never observe the host secret
+                        await manager._broadcast(
+                            state,
+                            {"type": "host_control", "payload": out_payload},
+                        )
+                elif msg_type == "mic_rtc":
+                    payload = data.get("payload")
+                    if isinstance(payload, dict):
+                        host_uid = state.room["host_user_id"]
+                        out_msg = {
+                            "type": "mic_rtc",
+                            "payload": {**payload, "from_uid": client_uid},
+                        }
+                        if client_uid != host_uid:
+                            # Guest phone -> Host speaker peer
+                            for ws_peer, peer_uid in list(state.connections.items()):
+                                if peer_uid == host_uid:
+                                    try:
+                                        await ws_peer.send_json(out_msg)
+                                    except Exception:
+                                        state.connections.pop(ws_peer, None)
+                        else:
+                            # Host -> specific guest phone peer
+                            target_uid = str(data.get("to_uid") or payload.get("to_uid") or "")
+                            if target_uid:
+                                for ws_peer, peer_uid in list(state.connections.items()):
+                                    if peer_uid == target_uid:
+                                        try:
+                                            await ws_peer.send_json(out_msg)
+                                        except Exception:
+                                            state.connections.pop(ws_peer, None)
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
         except WebSocketDisconnect:

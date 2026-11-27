@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import { Cover, displayTitle } from "./Cover";
 import { SyncStatusBadge } from "./SyncStatusBadge";
-import type { HostStageRoomInfo, StageReactionBurst } from "./HostRoomPanel";
+import type { HostStageRoomInfo, StageReactionBurst, UpNextItem } from "./HostRoomPanel";
+
+export interface EncoreTransitionState {
+  finishedTitle: string;
+  finishedSinger: string | null;
+  reactionCount: number;
+  nextItem: UpNextItem;
+  secondsLeft: number;
+  onPlayNow: () => void;
+  onCancel: () => void;
+}
 
 const REACTION_GLYPHS: Record<string, string> = {
   Clap: "👏",
@@ -23,6 +33,7 @@ interface TvStageOverlayProps {
   hasActiveSong: boolean;
   autoPreparingTitle: string | null;
   autoPrepareProgress: number | null;
+  encoreTransition?: EncoreTransitionState | null;
 }
 
 export function TvStageOverlay({
@@ -36,6 +47,7 @@ export function TvStageOverlay({
   hasActiveSong,
   autoPreparingTitle,
   autoPrepareProgress,
+  encoreTransition = null,
 }: TvStageOverlayProps) {
   const [qrMinimized, setQrMinimized] = useState(false);
   const [announcedEntryId, setAnnouncedEntryId] = useState<string | null>(null);
@@ -142,7 +154,7 @@ export function TvStageOverlay({
       )}
 
       {/* Prominent "Up Next" Toast when current song nears the end or pauses */}
-      {showProminentUpNext && nextUp && (
+      {!encoreTransition && showProminentUpNext && nextUp && (
         <div
           role="status"
           className="animate-toast-up pointer-events-auto absolute bottom-6 left-6 z-30 flex max-w-md items-center gap-3.5 rounded-2xl border border-white/18 bg-black/55 px-4 py-3 shadow-[0_16px_48px_rgba(0,0,0,0.5)] backdrop-blur-2xl"
@@ -185,6 +197,62 @@ export function TvStageOverlay({
               Play Now
             </button>
           )}
+        </div>
+      )}
+
+      {/* Encore Transition Countdown Card between party songs */}
+      {encoreTransition && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="animate-toast-up pointer-events-auto absolute inset-x-4 top-1/2 z-40 mx-auto max-w-md -translate-y-1/2 rounded-3xl border border-white/18 bg-[#0b0812]/82 p-6 text-center shadow-[0_28px_80px_rgba(0,0,0,0.68)] backdrop-blur-2xl"
+        >
+          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#ff7a98]">
+            Encore{encoreTransition.finishedSinger ? ` · ${encoreTransition.finishedSinger}` : ""}
+          </p>
+          <p className="mt-1 truncate text-sm text-white/65">
+            {displayTitle(encoreTransition.finishedTitle)}
+            {encoreTransition.reactionCount > 0
+              ? ` · 🔥 ${encoreTransition.reactionCount} ${encoreTransition.reactionCount === 1 ? "cheer" : "cheers"}`
+              : ""}
+          </p>
+
+          <div className="my-5 flex items-center gap-3.5 rounded-2xl border border-white/12 bg-white/[0.06] p-3 text-left">
+            <Cover
+              title={encoreTransition.nextItem.title}
+              songId={encoreTransition.nextItem.hostSongId || undefined}
+              size={52}
+              className="rounded-xl ring-1 ring-white/15"
+            />
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-white/55">
+                Up Next in {encoreTransition.secondsLeft}s
+              </p>
+              <p className="mt-0.5 truncate text-base font-bold text-white">
+                {displayTitle(encoreTransition.nextItem.title)}
+              </p>
+              <p className="truncate text-xs text-white/65">
+                Sung by <span className="font-semibold text-white">{encoreTransition.nextItem.requester}</span>
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-center gap-2.5">
+            <button
+              type="button"
+              onClick={encoreTransition.onPlayNow}
+              className="btn-primary px-6 py-2.5 text-xs"
+            >
+              Play Now
+            </button>
+            <button
+              type="button"
+              onClick={encoreTransition.onCancel}
+              className="btn-ghost px-5 py-2.5 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 

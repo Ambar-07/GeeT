@@ -12,7 +12,10 @@ import {
 import { z } from "zod";
 import {
   storeHostCapability,
+  type HostRemoteAction,
+  type HostRemoteCommand,
   type LiveLyricsSyncPayload,
+  type MicRtcSignal,
   type RoomSnapshot,
   type RoomSubscriptionCallbacks,
   type RoomSubscriptionHandle,
@@ -304,6 +307,7 @@ export function subscribeToLanRoom(
     callbacks.onConnectionState("connecting");
     try {
       ws = new WebSocket(buildWsUrl());
+      ws.binaryType = "arraybuffer";
     } catch {
       callbacks.onConnectionState("disconnected");
       scheduleReconnect();
@@ -318,6 +322,10 @@ export function subscribeToLanRoom(
 
     ws.onmessage = (event) => {
       if (closed) return;
+      if (event.data instanceof ArrayBuffer) {
+        callbacks.onMicAudio?.(event.data);
+        return;
+      }
       try {
         const msg = JSON.parse(String(event.data));
         if (msg?.type === "snapshot" && msg.payload) {
@@ -344,6 +352,28 @@ export function subscribeToLanRoom(
             positionMs:
               typeof msg.payload.positionMs === "number" ? msg.payload.positionMs : undefined,
             sentAtMs: typeof msg.payload.sentAtMs === "number" ? msg.payload.sentAtMs : undefined,
+          });
+        } else if (
+          msg?.type === "host_control" &&
+          typeof msg.payload?.action === "string"
+        ) {
+          callbacks.onHostControl?.({
+            action: msg.payload.action as HostRemoteAction,
+            value: typeof msg.payload.value === "number" ? msg.payload.value : undefined,
+          });
+        } else if (
+          msg?.type === "mic_rtc" &&
+          typeof msg.payload?.kind === "string"
+        ) {
+          callbacks.onMicRtcSignal?.({
+            fromUid: msg.payload.from_uid ? String(msg.payload.from_uid) : undefined,
+            toUid: msg.payload.to_uid ? String(msg.payload.to_uid) : undefined,
+            kind: msg.payload.kind as MicRtcSignal["kind"],
+            sdp: typeof msg.payload.sdp === "string" ? msg.payload.sdp : undefined,
+            candidate:
+              msg.payload.candidate && typeof msg.payload.candidate === "object"
+                ? (msg.payload.candidate as RTCIceCandidateInit)
+                : undefined,
           });
         }
       } catch {
@@ -402,6 +432,32 @@ export function subscribeToLanRoom(
     },
     requestLyricsSync() {
       // LAN guests fetch directly via HTTP /lan-api/rooms/{id}/lyrics/{hostSongId}
+    },
+    sendHostControl(command: HostRemoteCommand, capability: string) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "host_control", ...command, capability }));
+      }
+    },
+    sendMicAudio(pcm: ArrayBuffer) {
+      if (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 16384) {
+        ws.send(pcm);
+      }
+    },
+    sendMicRtcSignal(signal: MicRtcSignal) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "mic_rtc",
+            to_uid: signal.toUid,
+            payload: {
+              kind: signal.kind,
+              sdp: signal.sdp,
+              candidate: signal.candidate,
+              to_uid: signal.toUid,
+            },
+          })
+        );
+      }
     },
     unsubscribe() {
       closed = true;

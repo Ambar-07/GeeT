@@ -27,12 +27,35 @@ import {
   reconcileSnapshot,
   removeSongFromQueue,
   subscribeToRoom,
+  type HostRemoteCommand,
   type LiveLyricsSyncPayload,
+  type MicRtcSignal,
   type RoomSnapshot,
 } from "../lib/rooms";
+import { PhoneMicSender, type PhoneMicTransport } from "../lib/liveMic";
 import { isSupabaseConfigured } from "../lib/supabase";
 
 const NAME_KEY = "geet_participant_name";
+const REMOTE_CAP_PREFIX = "geet_remote_cap_";
+
+function readRemoteCapability(code: string): string | null {
+  if (!code) return null;
+  // Extract #host=<cap> from hash fragment once and immediately strip it from the URL bar
+  try {
+    const hash = window.location.hash;
+    if (hash.startsWith("#host=")) {
+      const cap = decodeURIComponent(hash.slice(6)).trim();
+      if (cap) {
+        sessionStorage.setItem(`${REMOTE_CAP_PREFIX}${code}`, cap);
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        return cap;
+      }
+    }
+    return sessionStorage.getItem(`${REMOTE_CAP_PREFIX}${code}`);
+  } catch {
+    return null;
+  }
+}
 const REACTION_BUTTONS = [
   { label: "Clap", icon: "👏" },
   { label: "Encore", icon: "🔥" },
@@ -69,6 +92,14 @@ export function RoomPage() {
   } | null>(null);
   const [lyricsLoading, setLyricsLoading] = useState(false);
   const [lyricsFullscreen, setLyricsFullscreen] = useState(false);
+  const [remoteCap, setRemoteCap] = useState<string | null>(() =>
+    readRemoteCapability(normalizedCode)
+  );
+  const [remoteVocalMix, setRemoteVocalMix] = useState(0.15);
+  const [phoneMicOn, setPhoneMicOn] = useState(false);
+  const [phoneMicLevel, setPhoneMicLevel] = useState(0);
+  const [phoneMicMode, setPhoneMicMode] = useState<PhoneMicTransport>("idle");
+  const [phoneMicError, setPhoneMicError] = useState<string | null>(null);
   const [playbackClock, setPlaybackClock] = useState<{
     status: "idle" | "playing" | "paused" | "ended";
     positionMs: number;
@@ -77,7 +108,16 @@ export function RoomPage() {
 
   const sendReactionRef = useRef<((label: string) => void) | null>(null);
   const requestLyricsSyncRef = useRef<(() => void) | null>(null);
+  const sendHostControlRef = useRef<((cmd: HostRemoteCommand, cap: string) => void) | null>(null);
+  const sendMicAudioRef = useRef<((pcm: ArrayBuffer) => void) | null>(null);
+  const sendMicRtcSignalRef = useRef<((signal: MicRtcSignal) => void) | null>(null);
+  const phoneMicRef = useRef<PhoneMicSender | null>(null);
   const prevTurnStateRef = useRef<"none" | "up_next" | "on_stage">("none");
+
+  useEffect(() => {
+    const cap = readRemoteCapability(normalizedCode);
+    if (cap) setRemoteCap(cap);
+  }, [normalizedCode]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim().toLowerCase()), 250);
@@ -159,6 +199,10 @@ export function RoomPage() {
           });
         }
       },
+      onMicRtcSignal: (signal: MicRtcSignal) => {
+        if (!active) return;
+        void phoneMicRef.current?.handleRtcSignal(signal);
+      },
     };
 
     const sub =
@@ -168,6 +212,9 @@ export function RoomPage() {
 
     sendReactionRef.current = sub.sendReaction;
     requestLyricsSyncRef.current = sub.requestLyricsSync;
+    sendHostControlRef.current = sub.sendHostControl;
+    sendMicAudioRef.current = sub.sendMicAudio;
+    sendMicRtcSignalRef.current = sub.sendMicRtcSignal;
 
     const initialFetch =
       transport === "lan" ? fetchLanRoomSnapshot(roomId) : fetchRoomSnapshot(roomId);
@@ -183,6 +230,10 @@ export function RoomPage() {
       active = false;
       sendReactionRef.current = null;
       requestLyricsSyncRef.current = null;
+      sendHostControlRef.current = null;
+      sendMicAudioRef.current = null;
+      sendMicRtcSignalRef.current = null;
+      phoneMicRef.current?.stop();
       sub.unsubscribe();
     };
   }, [roomId, userId, displayName, transport]);
@@ -363,6 +414,54 @@ export function RoomPage() {
     sendReactionRef.current?.(label);
     setReactionCooldown(true);
     setTimeout(() => setReactionCooldown(false), 1800);
+  }
+
+  function handleRemoteAction(command: HostRemoteCommand) {
+    if (!remoteCap) return;
+    sendHostControlRef.current?.(command, remoteCap);
+  }
+
+  useEffect(() => {
+    if (!phoneMicOn) {
+      setPhoneMicLevel(0);
+      setPhoneMicMode("idle");
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setPhoneMicLevel(phoneMicRef.current?.getLevel() ?? 0);
+      setPhoneMicMode(phoneMicRef.current?.getMode() ?? "idle");
+    }, 65);
+    return () => window.clearInterval(timer);
+  }, [phoneMicOn]);
+
+  useEffect(() => {
+    return () => {
+      phoneMicRef.current?.stop();
+    };
+  }, []);
+
+  async function togglePhoneMic() {
+    setPhoneMicError(null);
+    if (phoneMicOn) {
+      phoneMicRef.current?.stop();
+      setPhoneMicOn(false);
+      setPhoneMicMode("idle");
+      return;
+    }
+    try {
+      if (!phoneMicRef.current) phoneMicRef.current = new PhoneMicSender();
+      await phoneMicRef.current.start(
+        (pcm) => sendMicAudioRef.current?.(pcm),
+        (sig) => sendMicRtcSignalRef.current?.(sig)
+      );
+      setPhoneMicOn(true);
+      setPhoneMicMode(phoneMicRef.current.getMode());
+    } catch (err) {
+      phoneMicRef.current?.stop();
+      setPhoneMicOn(false);
+      setPhoneMicMode("idle");
+      setPhoneMicError(err instanceof Error ? err.message : "Could not access phone microphone.");
+    }
   }
 
   async function handleJoin(e: React.FormEvent) {
@@ -631,6 +730,125 @@ export function RoomPage() {
               onSendReaction={handleSendReaction}
               reactionCooldown={reactionCooldown}
             />
+          </section>
+        )}
+
+        {/* Private Host Remote Control Deck (unlocked only via #host=<capability> link) */}
+        {remoteCap && (
+          <section
+            aria-label="Host remote controls"
+            className="space-y-3 rounded-2xl border border-[#fa2d48]/30 bg-[#0d0a15]/75 p-4 shadow-[0_12px_36px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#ff7a98]">
+                <span className="h-1.5 w-1.5 rounded-full bg-[#fa2d48]" />
+                Host Remote
+              </span>
+              <span className="text-[10px] text-white/45">Controls TV Stage</span>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                type="button"
+                onClick={() => handleRemoteAction({ action: "toggle_play" })}
+                className="btn-light py-2 text-xs"
+              >
+                {playbackClock.status === "playing" ? "Pause" : "Play"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRemoteAction({ action: "next" })}
+                className="btn-ghost py-2 text-xs"
+              >
+                Next ⏭
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRemoteAction({ action: "toggle_tv" })}
+                className="btn-ghost py-2 text-xs"
+              >
+                TV Stage
+              </button>
+            </div>
+            <div className="flex items-center gap-3 pt-0.5">
+              <label htmlFor="remote-vocal-mix" className="shrink-0 text-[11px] font-medium text-white/65">
+                Vocal Guide
+              </label>
+              <input
+                id="remote-vocal-mix"
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={remoteVocalMix}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setRemoteVocalMix(val);
+                  handleRemoteAction({ action: "vocal_mix", value: val });
+                }}
+                className="range h-1 flex-1"
+              />
+              <span className="w-8 text-right font-mono text-[10px] text-white/60">
+                {Math.round(remoteVocalMix * 100)}%
+              </span>
+            </div>
+          </section>
+        )}
+
+        {/* Wireless Phone Microphone (streams voice live to Host PC speakers over LAN Wi-Fi) */}
+        {transport === "lan" && (
+          <section className="space-y-2.5 rounded-2xl border border-white/12 bg-black/38 p-3.5 backdrop-blur-xl sm:px-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="flex items-center gap-2 text-xs font-semibold text-white">
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      phoneMicOn
+                        ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.85)]"
+                        : "bg-white/30"
+                    }`}
+                  />
+                  <span>Wireless Phone Mic</span>
+                </p>
+                <p className="mt-0.5 text-[11px] text-white/50">
+                  {phoneMicOn
+                    ? connState !== "subscribed"
+                      ? "Mic open — waiting for room WebSocket…"
+                      : phoneMicMode === "webrtc"
+                        ? "Direct LAN audio (low latency)"
+                        : phoneMicMode === "connecting"
+                          ? "Connecting direct LAN audio…"
+                          : "Streaming over Wi-Fi (low-latency fallback)"
+                    : "Sing into your phone over Wi-Fi"}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-label="Wireless phone microphone"
+                aria-checked={phoneMicOn}
+                onClick={() => void togglePhoneMic()}
+                className={`shrink-0 rounded-full px-4 py-2 text-xs font-semibold transition ${
+                  phoneMicOn
+                    ? "bg-emerald-400 text-ink-950"
+                    : "btn-primary px-4 py-2 text-xs"
+                }`}
+              >
+                {phoneMicOn ? "Mic On" : "Start Mic"}
+              </button>
+            </div>
+            {phoneMicOn && (
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/12" aria-hidden="true">
+                <div
+                  className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                  style={{ width: `${Math.round(phoneMicLevel * 100)}%` }}
+                />
+              </div>
+            )}
+            {phoneMicError && (
+              <p role="alert" className="text-[11px] leading-relaxed text-[#ff7a98]">
+                {phoneMicError}
+              </p>
+            )}
           </section>
         )}
 

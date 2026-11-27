@@ -301,6 +301,21 @@ export interface LiveLyricsSyncPayload {
   sentAtMs?: number;
 }
 
+export type HostRemoteAction = "toggle_play" | "next" | "toggle_tv" | "vocal_mix";
+
+export interface HostRemoteCommand {
+  action: HostRemoteAction;
+  value?: number;
+}
+
+export interface MicRtcSignal {
+  fromUid?: string;
+  toUid?: string;
+  kind: "offer" | "answer" | "ice" | "stop";
+  sdp?: string;
+  candidate?: RTCIceCandidateInit;
+}
+
 export interface RoomSubscriptionCallbacks {
   onSnapshot: (snap: RoomSnapshot) => void;
   onPresenceCount: (onlineUserIds: string[]) => void;
@@ -308,12 +323,18 @@ export interface RoomSubscriptionCallbacks {
   onConnectionState: (state: "connecting" | "subscribed" | "disconnected") => void;
   onLyricsSync?: (payload: LiveLyricsSyncPayload) => void;
   onLyricsRequest?: () => void;
+  onHostControl?: (command: HostRemoteCommand) => void;
+  onMicAudio?: (pcm: ArrayBuffer) => void;
+  onMicRtcSignal?: (signal: MicRtcSignal) => void;
 }
 
 export interface RoomSubscriptionHandle {
   sendReaction: (label: string) => void;
   sendLyricsSync: (payload: LiveLyricsSyncPayload) => void;
   requestLyricsSync: () => void;
+  sendHostControl: (command: HostRemoteCommand, capability: string) => void;
+  sendMicAudio: (pcm: ArrayBuffer) => void;
+  sendMicRtcSignal: (signal: MicRtcSignal) => void;
   unsubscribe: () => void;
 }
 
@@ -398,6 +419,20 @@ export function subscribeToRoom(
     .on("broadcast", { event: "lyrics_request" }, () => {
       callbacks.onLyricsRequest?.();
     })
+    .on("broadcast", { event: "host_control" }, ({ payload }) => {
+      telemetry.realtimeMessages += 1;
+      const expectedCap = getStoredHostCapability(roomId);
+      if (
+        expectedCap &&
+        payload?.capability === expectedCap &&
+        typeof payload?.action === "string"
+      ) {
+        callbacks.onHostControl?.({
+          action: payload.action as HostRemoteAction,
+          value: typeof payload.value === "number" ? payload.value : undefined,
+        });
+      }
+    })
     .subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         callbacks.onConnectionState("subscribed");
@@ -436,6 +471,20 @@ export function subscribeToRoom(
         event: "lyrics_request",
         payload: { requester: userId },
       });
+    },
+    sendHostControl(command: HostRemoteCommand, capability: string) {
+      telemetry.realtimeMessages += 1;
+      void channel.send({
+        type: "broadcast",
+        event: "host_control",
+        payload: { ...command, capability },
+      });
+    },
+    sendMicAudio() {
+      // Wireless phone mic streaming is LAN-only (low-latency local Wi-Fi)
+    },
+    sendMicRtcSignal() {
+      // Direct LAN WebRTC signaling is LAN-only
     },
     unsubscribe() {
       telemetry.activeChannels = Math.max(0, telemetry.activeChannels - 1);

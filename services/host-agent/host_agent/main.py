@@ -683,17 +683,21 @@ def create_app(
             verify_stem_integrity(inst_tmp, expected_ms)
             verify_stem_integrity(voc_tmp, expected_ms)
 
-            # Atomic cache promotion inside stems_root/<song_id>
+            # Atomic zero-copy cache promotion inside stems_root/<song_id>
             song_stem_dir = stems_root / song_id
             song_stem_dir.mkdir(parents=True, exist_ok=True)
             inst_dest = song_stem_dir / "instrumental.wav"
             voc_dest = song_stem_dir / "vocal.wav"
-            inst_stage = song_stem_dir / f".instrumental.{job_id}.tmp"
-            voc_stage = song_stem_dir / f".vocal.{job_id}.tmp"
-            shutil.copy2(inst_tmp, inst_stage)
-            shutil.copy2(voc_tmp, voc_stage)
-            os.replace(inst_stage, inst_dest)
-            os.replace(voc_stage, voc_dest)
+            try:
+                os.replace(inst_tmp, inst_dest)
+                os.replace(voc_tmp, voc_dest)
+            except OSError:
+                inst_stage = song_stem_dir / f".instrumental.{job_id}.tmp"
+                voc_stage = song_stem_dir / f".vocal.{job_id}.tmp"
+                shutil.copy2(inst_tmp, inst_stage)
+                shutil.copy2(voc_tmp, voc_stage)
+                os.replace(inst_stage, inst_dest)
+                os.replace(voc_stage, voc_dest)
 
             with db_lock:
                 conn.execute(

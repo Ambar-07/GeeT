@@ -18,6 +18,7 @@ services/host-agent/cache/
 *.db
 *.sqlite3
 .e2e-tmp/
+.cert/
 
 # Logs & OS
 *.log

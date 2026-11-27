@@ -31,6 +31,8 @@ import {
   setHostRoomStatus,
   subscribeToRoom,
   syncPlaybackCheckpoint,
+  type HostRemoteCommand,
+  type MicRtcSignal,
   type RoomSnapshot,
 } from "../lib/rooms";
 import { isSupabaseConfigured } from "../lib/supabase";
@@ -106,6 +108,9 @@ interface HostRoomPanelProps {
   getPlaybackClock?: () => { status: "idle" | "playing" | "paused" | "ended"; positionMs: number };
   onStageRoomChange?: (info: HostStageRoomInfo) => void;
   onReactionBurst?: (burst: StageReactionBurst) => void;
+  onRemoteCommand?: (command: HostRemoteCommand) => void;
+  onMicAudio?: (pcm: ArrayBuffer) => void;
+  onMicRtcSignal?: (signal: MicRtcSignal, sendReply: (reply: MicRtcSignal) => void) => void;
 }
 
 export function HostRoomPanel({
@@ -116,6 +121,9 @@ export function HostRoomPanel({
   getPlaybackClock,
   onStageRoomChange,
   onReactionBurst,
+  onRemoteCommand,
+  onMicAudio,
+  onMicRtcSignal,
 }: HostRoomPanelProps) {
   const defaultTransport: RoomTransportMode = isSupabaseConfigured ? "cloud" : "lan";
 
@@ -133,11 +141,19 @@ export function HostRoomPanel({
   const [reactions, setReactions] = useState<Array<{ sender: string; label: string }>>([]);
   const [msg, setMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedRemote, setCopiedRemote] = useState(false);
+  const [qrMode, setQrMode] = useState<"guest" | "remote">("guest");
   const [busy, setBusy] = useState(false);
 
   const lastPlayingEntryIdRef = useRef<string | null>(null);
   const onReactionBurstRef = useRef(onReactionBurst);
   onReactionBurstRef.current = onReactionBurst;
+  const onRemoteCommandRef = useRef(onRemoteCommand);
+  onRemoteCommandRef.current = onRemoteCommand;
+  const onMicAudioRef = useRef(onMicAudio);
+  onMicAudioRef.current = onMicAudio;
+  const onMicRtcSignalRef = useRef(onMicRtcSignal);
+  onMicRtcSignalRef.current = onMicRtcSignal;
   const activeLyricsRef = useRef(activeLyrics);
   activeLyricsRef.current = activeLyrics;
   const getPlaybackClockRef = useRef(getPlaybackClock);
@@ -182,16 +198,23 @@ export function HostRoomPanel({
   }, [transport, lanInfo?.lan_ip]);
 
   const joinUrl = snapshot ? buildJoinUrl(appOrigin, snapshot.room.code) : null;
+  const remoteJoinUrl = useMemo(() => {
+    if (!joinUrl || !roomId) return null;
+    const cap = getStoredHostCapability(roomId);
+    return cap ? `${joinUrl}#host=${encodeURIComponent(cap)}` : null;
+  }, [joinUrl, roomId]);
+
+  const activeQrUrl = qrMode === "remote" && remoteJoinUrl ? remoteJoinUrl : joinUrl;
 
   useEffect(() => {
-    if (!joinUrl) {
+    if (!activeQrUrl) {
       setQrDataUrl(null);
       return;
     }
-    QRCode.toDataURL(joinUrl, { width: 180, margin: 1 })
+    QRCode.toDataURL(activeQrUrl, { width: 180, margin: 1 })
       .then(setQrDataUrl)
       .catch(() => setQrDataUrl(null));
-  }, [joinUrl]);
+  }, [activeQrUrl]);
 
   const fetchSnapshotForMode = useCallback(
     async (id: string, mode: RoomTransportMode): Promise<RoomSnapshot> => {
@@ -241,6 +264,10 @@ export function HostRoomPanel({
               if (active) setConnState(st);
             },
             onLyricsRequest: () => pushLiveLyrics(),
+            onHostControl: (cmd) => onRemoteCommandRef.current?.(cmd),
+            onMicAudio: (pcm) => onMicAudioRef.current?.(pcm),
+            onMicRtcSignal: (sig) =>
+              onMicRtcSignalRef.current?.(sig, (reply) => sub.sendMicRtcSignal(reply)),
           });
           sendLyricsSyncRef.current = sub.sendLyricsSync;
           unsub = sub.unsubscribe;
@@ -259,6 +286,10 @@ export function HostRoomPanel({
               if (active) setConnState(st);
             },
             onLyricsRequest: () => pushLiveLyrics(),
+            onHostControl: (cmd) => onRemoteCommandRef.current?.(cmd),
+            onMicAudio: (pcm) => onMicAudioRef.current?.(pcm),
+            onMicRtcSignal: (sig) =>
+              onMicRtcSignalRef.current?.(sig, (reply) => sub.sendMicRtcSignal(reply)),
           });
           sendLyricsSyncRef.current = sub.sendLyricsSync;
           unsub = sub.unsubscribe;
@@ -600,6 +631,21 @@ export function HostRoomPanel({
     }
   }
 
+  async function handleCopyRemoteUrl() {
+    if (!joinUrl || !roomId) return;
+    const cap = getStoredHostCapability(roomId);
+    if (!cap) return;
+    // Put host capability in URL hash fragment so it stays out of server access logs
+    const remoteUrl = `${joinUrl}#host=${encodeURIComponent(cap)}`;
+    try {
+      await navigator.clipboard.writeText(remoteUrl);
+      setCopiedRemote(true);
+      setTimeout(() => setCopiedRemote(false), 1800);
+    } catch {
+      setMsg("Could not copy remote link.");
+    }
+  }
+
   return (
     <section className="thin-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto rounded-2xl border border-white/[0.08] bg-white/[0.03] p-3.5 backdrop-blur-xl">
       <div className="flex items-center justify-between gap-2">
@@ -660,52 +706,88 @@ export function HostRoomPanel({
         </div>
       ) : (
         <>
-          {/* Compact Room Code & QR Card */}
-          <div className="flex items-center gap-3 rounded-2xl border border-white/[0.08] bg-black/30 p-2.5">
-            {qrDataUrl && (
-              <div className="shrink-0 rounded-xl bg-white p-1.5 shadow-sm">
-                <img
-                  src={qrDataUrl}
-                  alt={`Join room ${snapshot.room.code}`}
-                  className="h-[64px] w-[64px]"
-                />
+          {/* Compact Room Code & Scannable Guest/Remote QR Card */}
+          <div className="space-y-2 rounded-2xl border border-white/[0.08] bg-black/30 p-2.5">
+            {remoteJoinUrl && (
+              <div className="flex items-center justify-between gap-2">
+                <div role="group" aria-label="QR code mode" className="flex rounded-full border border-white/10 bg-black/40 p-0.5 text-[10px]">
+                  <button
+                    type="button"
+                    onClick={() => setQrMode("guest")}
+                    className={`rounded-full px-2.5 py-0.5 font-medium transition ${
+                      qrMode === "guest" ? "bg-white text-ink-950" : "text-white/55 hover:text-white"
+                    }`}
+                  >
+                    Guest QR
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setQrMode("remote")}
+                    className={`rounded-full px-2.5 py-0.5 font-medium transition ${
+                      qrMode === "remote" ? "bg-[#fa2d48] text-white" : "text-white/55 hover:text-white"
+                    }`}
+                  >
+                    Host Remote QR
+                  </button>
+                </div>
               </div>
             )}
-            <div className="min-w-0 flex-1 space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-base font-bold tracking-[0.12em] text-white">
-                  {snapshot.room.code}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => void handleCopyJoinUrl()}
-                  className="rounded-full bg-white/[0.1] px-2.5 py-1 text-[10px] font-medium text-white/85 transition hover:bg-white/[0.18] hover:text-white"
-                >
-                  {copied ? "Copied ✓" : "Copy"}
-                </button>
-              </div>
-              <p className="text-[11px] text-white/55">
-                {onlineIds.length} online · {snapshot.songs.length} songs
-              </p>
-              {joinUrl && (
-                <a
-                  href={`/join/${encodeURIComponent(snapshot.room.code)}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block truncate font-mono text-[10px] text-white/60 transition hover:text-white hover:underline"
-                  title={joinUrl}
-                >
-                  {joinUrl.replace(/^https?:\/\//, "")}
-                </a>
+            <div className="flex items-center gap-3">
+              {qrDataUrl && (
+                <div className="shrink-0 rounded-xl bg-white p-1.5 shadow-sm">
+                  <img
+                    src={qrDataUrl}
+                    alt={qrMode === "remote" ? `Host remote QR for room ${snapshot.room.code}` : `Join room ${snapshot.room.code}`}
+                    className="h-[68px] w-[68px]"
+                  />
+                </div>
               )}
-              {reactions.length > 0 && (
-                <p className="truncate text-[11px] text-[#ff7a98]">
-                  {reactions
-                    .slice(0, 2)
-                    .map((r) => `${r.sender}: ${r.label}`)
-                    .join(" · ")}
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="flex items-center justify-between gap-1.5">
+                  <span className="font-mono text-base font-bold tracking-[0.12em] text-white">
+                    {snapshot.room.code}
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyJoinUrl()}
+                      className="rounded-full bg-white/[0.1] px-2.5 py-1 text-[10px] font-medium text-white/85 transition hover:bg-white/[0.18] hover:text-white"
+                    >
+                      {copied ? "Copied ✓" : "Copy"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyRemoteUrl()}
+                      title="Copy private Host Remote link for your phone"
+                      className="rounded-full bg-[#fa2d48]/18 px-2.5 py-1 text-[10px] font-medium text-[#ff8da6] transition hover:bg-[#fa2d48]/30 hover:text-white"
+                    >
+                      {copiedRemote ? "Copied ✓" : "Remote"}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-white/55">
+                  {onlineIds.length} online · {snapshot.songs.length} songs
                 </p>
-              )}
+                {joinUrl && (
+                  <a
+                    href={`/join/${encodeURIComponent(snapshot.room.code)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block truncate font-mono text-[10px] text-white/60 transition hover:text-white hover:underline"
+                    title={joinUrl}
+                  >
+                    {joinUrl.replace(/^https?:\/\//, "")}
+                  </a>
+                )}
+                {reactions.length > 0 && (
+                  <p className="truncate text-[11px] text-[#ff7a98]">
+                    {reactions
+                      .slice(0, 2)
+                      .map((r) => `${r.sender}: ${r.label}`)
+                      .join(" · ")}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
 

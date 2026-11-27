@@ -317,3 +317,55 @@ def test_lan_room_lyrics_endpoint_and_ws_sync(tmp_path):
             pushed = ws_guest.receive_json()
             assert pushed["type"] == "lyrics_sync"
             assert pushed["payload"]["offsetMs"] == 200
+
+
+def test_lan_room_host_remote_control_capability_check():
+    client = _client()
+    room = client.post("/lan/rooms").json()
+    room_id = room["room_id"]
+    cap = room["host_capability"]
+    host_uid = room["host_user_id"]
+    guest = client.post(f"/lan/rooms/{room_id}/join", json={"display_name": "Remote"}).json()
+
+    with client.websocket_connect(f"/lan/rooms/{room_id}/ws?user_id={host_uid}&display_name=Host") as ws_host:
+        ws_host.receive_json()  # snapshot
+        ws_host.receive_json()  # presence
+        with client.websocket_connect(
+            f"/lan/rooms/{room_id}/ws?user_id={guest['user_id']}&display_name=Remote"
+        ) as ws_remote:
+            ws_remote.receive_json()  # snapshot
+            ws_remote.receive_json()  # presence
+            ws_host.receive_json()  # presence update
+
+            # Invalid capability is ignored; valid capability forwards command and strips secret
+            ws_remote.send_json({"type": "host_control", "action": "toggle_tv", "capability": "wrong"})
+            ws_remote.send_json({"type": "host_control", "action": "vocal_mix", "value": 1.5, "capability": cap})
+
+            msg = ws_host.receive_json()
+            assert msg["type"] == "host_control"
+            assert msg["payload"] == {"action": "vocal_mix", "value": 1.0}
+            assert "capability" not in msg["payload"]
+            assert ws_remote.receive_json()["type"] == "host_control"
+
+            # Wireless phone mic PCM bytes forward directly to host WS only
+            ws_remote.send_bytes(b"\x01\x02\x03\x04")
+            assert ws_host.receive_bytes() == b"\x01\x02\x03\x04"
+
+            # Direct LAN WebRTC signaling relays guest <-> host with sender identity
+            ws_remote.send_json({"type": "mic_rtc", "payload": {"kind": "offer", "sdp": "v=0"}})
+            offer = ws_host.receive_json()
+            assert offer["type"] == "mic_rtc"
+            assert offer["payload"]["kind"] == "offer"
+            assert offer["payload"]["from_uid"] == guest["user_id"]
+
+            ws_host.send_json(
+                {
+                    "type": "mic_rtc",
+                    "to_uid": guest["user_id"],
+                    "payload": {"kind": "answer", "sdp": "v=0"},
+                }
+            )
+            answer = ws_remote.receive_json()
+            assert answer["type"] == "mic_rtc"
+            assert answer["payload"]["kind"] == "answer"
+            assert answer["payload"]["from_uid"] == host_uid
