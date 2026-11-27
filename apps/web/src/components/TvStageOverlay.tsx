@@ -139,15 +139,17 @@ export function TvStageOverlay({
         ))}
       </div>
 
-      {/* Subtle Auto-Prepare Pill */}
+      {/* Subtle Preparing Pill (pinned to top-right clear of album artwork and TV controls) */}
       {autoPreparingTitle && (
         <div
           role="status"
-          className="pointer-events-auto absolute left-5 top-16 inline-flex items-center gap-2 rounded-full border border-white/14 bg-black/50 px-3.5 py-1.5 font-mono text-[11px] text-white/80 shadow-lg backdrop-blur-xl"
+          className={`pointer-events-auto absolute z-30 inline-flex items-center gap-2 rounded-full border border-white/14 bg-black/55 px-3.5 py-1.5 font-mono text-[11px] text-white/85 shadow-lg backdrop-blur-xl ${
+            tvMode ? "right-28 top-5" : "right-5 top-4"
+          }`}
         >
           <span className="h-2 w-2 animate-pulse rounded-full bg-[#fa2d48]" />
           <span className="max-w-[240px] truncate">
-            Auto-preparing: {displayTitle(autoPreparingTitle)}
+            Preparing: {displayTitle(autoPreparingTitle)}
             {autoPrepareProgress !== null ? ` (${autoPrepareProgress}%)` : ""}
           </span>
         </div>
