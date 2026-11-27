@@ -29,6 +29,37 @@ export async function fetchHostHealth(): Promise<HostHealth> {
   return HostHealthSchema.parse(await res.json());
 }
 
+export async function fetchLibraryFolders(): Promise<string[]> {
+  const res = await fetch(`${BASE_URL}/library/folders`);
+  if (!res.ok) throw new Error(`List folders failed: ${res.status}`);
+  const data = (await res.json()) as { folders?: string[] };
+  return Array.isArray(data.folders) ? data.folders : [];
+}
+
+export async function pickLibraryFolder(): Promise<string | null> {
+  const res = await fetch(`${BASE_URL}/library/pick-folder`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `Folder picker failed: ${res.status}`);
+  }
+  const data = (await res.json()) as { path?: string | null };
+  return data.path ?? null;
+}
+
+export async function removeLibraryFolder(path: string): Promise<string[]> {
+  const res = await fetch(`${BASE_URL}/library/folders`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `Remove folder failed: ${res.status}`);
+  }
+  const data = (await res.json()) as { folders?: string[] };
+  return Array.isArray(data.folders) ? data.folders : [];
+}
+
 export async function selectLibraryFolder(path: string): Promise<{ approved_dirs: number }> {
   const res = await fetch(`${BASE_URL}/library/select`, {
     method: "POST",

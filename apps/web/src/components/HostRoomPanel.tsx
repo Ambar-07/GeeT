@@ -706,79 +706,67 @@ export function HostRoomPanel({
         </div>
       ) : (
         <>
-          {/* Compact Room Code & Scannable Guest/Remote QR Card */}
-          <div className="space-y-2 rounded-2xl border border-white/[0.08] bg-black/30 p-2.5">
+          {/* Redesigned Room Code & Scannable Guest/Remote QR Card */}
+          <div
+            className={`space-y-3 overflow-hidden rounded-2xl border bg-black/32 p-3 transition-colors ${
+              qrMode === "remote" ? "border-[#fa2d48]/35" : "border-white/[0.08]"
+            }`}
+          >
             {remoteJoinUrl && (
-              <div className="flex items-center justify-between gap-2">
-                <div role="group" aria-label="QR code mode" className="flex rounded-full border border-white/10 bg-black/40 p-0.5 text-[10px]">
-                  <button
-                    type="button"
-                    onClick={() => setQrMode("guest")}
-                    className={`rounded-full px-2.5 py-0.5 font-medium transition ${
-                      qrMode === "guest" ? "bg-white text-ink-950" : "text-white/55 hover:text-white"
-                    }`}
-                  >
-                    Guest QR
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setQrMode("remote")}
-                    className={`rounded-full px-2.5 py-0.5 font-medium transition ${
-                      qrMode === "remote" ? "bg-[#fa2d48] text-white" : "text-white/55 hover:text-white"
-                    }`}
-                  >
-                    Host Remote QR
-                  </button>
-                </div>
+              <div
+                role="group"
+                aria-label="QR code mode"
+                className="grid grid-cols-2 rounded-full border border-white/10 bg-black/45 p-0.5 text-[11px]"
+              >
+                <button
+                  type="button"
+                  onClick={() => setQrMode("guest")}
+                  className={`rounded-full py-1 font-medium transition ${
+                    qrMode === "guest" ? "bg-white text-ink-950 shadow-sm" : "text-white/55 hover:text-white"
+                  }`}
+                >
+                  Guest QR
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setQrMode("remote")}
+                  className={`rounded-full py-1 font-medium transition ${
+                    qrMode === "remote" ? "bg-[#fa2d48] text-white shadow-sm" : "text-white/55 hover:text-white"
+                  }`}
+                >
+                  Host Remote
+                </button>
               </div>
             )}
+
             <div className="flex items-center gap-3">
               {qrDataUrl && (
-                <div className="shrink-0 rounded-xl bg-white p-1.5 shadow-sm">
+                <div
+                  className={`shrink-0 rounded-xl bg-white p-1.5 shadow-sm ring-2 ${
+                    qrMode === "remote" ? "ring-[#fa2d48]/60" : "ring-transparent"
+                  }`}
+                >
                   <img
                     src={qrDataUrl}
                     alt={qrMode === "remote" ? `Host remote QR for room ${snapshot.room.code}` : `Join room ${snapshot.room.code}`}
-                    className="h-[68px] w-[68px]"
+                    className="h-[78px] w-[78px]"
                   />
                 </div>
               )}
               <div className="min-w-0 flex-1 space-y-1">
-                <div className="flex items-center justify-between gap-1.5">
-                  <span className="font-mono text-base font-bold tracking-[0.12em] text-white">
-                    {snapshot.room.code}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyJoinUrl()}
-                      className="rounded-full bg-white/[0.1] px-2.5 py-1 text-[10px] font-medium text-white/85 transition hover:bg-white/[0.18] hover:text-white"
-                    >
-                      {copied ? "Copied ✓" : "Copy"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyRemoteUrl()}
-                      title="Copy private Host Remote link for your phone"
-                      className="rounded-full bg-[#fa2d48]/18 px-2.5 py-1 text-[10px] font-medium text-[#ff8da6] transition hover:bg-[#fa2d48]/30 hover:text-white"
-                    >
-                      {copiedRemote ? "Copied ✓" : "Remote"}
-                    </button>
-                  </div>
-                </div>
+                <p
+                  className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${
+                    qrMode === "remote" ? "text-[#ff7a98]" : "text-white/45"
+                  }`}
+                >
+                  {qrMode === "remote" ? "Private Remote" : "Room Code"}
+                </p>
+                <p className="truncate font-mono text-[17px] font-bold tracking-[0.13em] text-white">
+                  {snapshot.room.code}
+                </p>
                 <p className="text-[11px] text-white/55">
                   {onlineIds.length} online · {snapshot.songs.length} songs
                 </p>
-                {joinUrl && (
-                  <a
-                    href={`/join/${encodeURIComponent(snapshot.room.code)}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="block truncate font-mono text-[10px] text-white/60 transition hover:text-white hover:underline"
-                    title={joinUrl}
-                  >
-                    {joinUrl.replace(/^https?:\/\//, "")}
-                  </a>
-                )}
                 {reactions.length > 0 && (
                   <p className="truncate text-[11px] text-[#ff7a98]">
                     {reactions
@@ -788,6 +776,39 @@ export function HostRoomPanel({
                   </p>
                 )}
               </div>
+            </div>
+
+            {/* Single-row Copy + Open footer — zero horizontal overflow */}
+            <div className="flex items-center gap-1.5 border-t border-white/[0.07] pt-2.5">
+              <button
+                type="button"
+                onClick={() => void (qrMode === "remote" ? handleCopyRemoteUrl() : handleCopyJoinUrl())}
+                title={qrMode === "remote" ? "Copy private Host Remote link" : "Copy guest join link"}
+                className={`inline-flex h-8 min-w-0 flex-1 items-center justify-center rounded-full px-3 text-[11px] font-medium transition ${
+                  qrMode === "remote"
+                    ? "bg-[#fa2d48]/20 text-[#ff8da6] hover:bg-[#fa2d48]/30 hover:text-white"
+                    : "bg-white/[0.1] text-white/90 hover:bg-white/[0.18] hover:text-white"
+                }`}
+              >
+                {qrMode === "remote"
+                  ? copiedRemote
+                    ? "Remote Link Copied ✓"
+                    : "Copy Remote Link"
+                  : copied
+                    ? "Join Link Copied ✓"
+                    : "Copy Join Link"}
+              </button>
+              {joinUrl && (
+                <a
+                  href={`/join/${encodeURIComponent(snapshot.room.code)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={joinUrl}
+                  className="inline-flex h-8 shrink-0 items-center justify-center rounded-full bg-white/[0.07] px-3 text-[11px] font-medium text-white/75 transition hover:bg-white/[0.15] hover:text-white"
+                >
+                  Open ↗
+                </a>
+              )}
             </div>
           </div>
 
@@ -857,9 +878,9 @@ export function HostRoomPanel({
             </div>
 
             {queuedEntries.length === 0 ? (
-              <p className="py-6 text-center text-xs text-white/40">
-                Waiting for guests to queue songs…
-              </p>
+              <div className="rounded-xl border border-dashed border-white/[0.09] bg-white/[0.015] px-3 py-6 text-center">
+                <p className="text-xs text-white/45">Waiting for guests to queue songs…</p>
+              </div>
             ) : (
               <ul className="thin-scroll min-h-0 flex-1 space-y-1 overflow-y-auto pr-0.5">
                 {queuedEntries.map((entry, idx) => {

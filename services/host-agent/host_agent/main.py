@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -345,12 +346,38 @@ def _stream_file_range(file_path: Path, mime: str, request: Request) -> Streamin
     return StreamingResponse(iter_file(), status_code=status_code, media_type=mime, headers=headers)
 
 
+def _pick_native_folder() -> str | None:
+    """Open the host OS native folder picker in a short-lived helper process."""
+    script = (
+        "import sys, tkinter as tk; "
+        "from tkinter import filedialog; "
+        "root = tk.Tk(); root.withdraw(); "
+        "root.attributes('-topmost', True); "
+        "chosen = filedialog.askdirectory(title='Select Music Folder') or ''; "
+        "root.destroy(); "
+        "sys.stdout.buffer.write(chosen.encode('utf-8'))"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            timeout=180,
+        )
+        if proc.returncode != 0:
+            return None
+        chosen = proc.stdout.decode("utf-8", errors="replace").strip()
+        return chosen or None
+    except Exception:
+        return None
+
+
 def create_app(
     db_conn: sqlite3.Connection | None = None,
     cache_dir: Path | None = None,
     separator_fn: SeparatorFn | None = None,
     data_dir: Path | None = None,
     auth_token: str | None = None,
+    folder_picker_fn: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     cfg = get_config()
     conn = db_conn or connect_db(cfg["db_path"])
@@ -409,6 +436,27 @@ def create_app(
             "approved_dirs": dir_count,
             "song_count": song_count,
         }
+
+    @app.get("/library/folders")
+    def list_library_folders():
+        return {"folders": [str(p) for p in _approved_paths()]}
+
+    @app.post("/library/pick-folder", dependencies=[Depends(_require_host_token)])
+    def pick_library_folder():
+        picker = folder_picker_fn or _pick_native_folder
+        chosen = picker()
+        if not chosen:
+            return {"path": None}
+        target = Path(chosen).expanduser().resolve()
+        return {"path": str(target) if target.exists() and target.is_dir() else None}
+
+    @app.delete("/library/folders", dependencies=[Depends(_require_host_token)])
+    def remove_library_folder(req: SelectLibraryRequest):
+        target = str(Path(req.path).expanduser().resolve())
+        with db_lock:
+            conn.execute("DELETE FROM approved_dirs WHERE path = ? OR path = ?", (target, req.path))
+            conn.commit()
+        return {"ok": True, "folders": [str(p) for p in _approved_paths()]}
 
     @app.post("/library/select", dependencies=[Depends(_require_host_token)])
     def select_library(req: SelectLibraryRequest):

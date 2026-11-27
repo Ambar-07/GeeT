@@ -19,7 +19,13 @@ def _make_wav(path: Path, frames: int = 800) -> None:
         w.writeframes(b"\x01\x02" * frames)
 
 
-def _client(cache_dir: Path | None = None, separator_fn=None, data_dir: Path | None = None, auth_token: str | None = None) -> TestClient:
+def _client(
+    cache_dir: Path | None = None,
+    separator_fn=None,
+    data_dir: Path | None = None,
+    auth_token: str | None = None,
+    folder_picker_fn=None,
+) -> TestClient:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
@@ -30,6 +36,7 @@ def _client(cache_dir: Path | None = None, separator_fn=None, data_dir: Path | N
             separator_fn=separator_fn,
             data_dir=data_dir,
             auth_token=auth_token,
+            folder_picker_fn=folder_picker_fn,
         )
     )
 
@@ -402,3 +409,23 @@ def test_separator_pipe_decode_and_wav_write(tmp_path: Path):
     assert decoded.shape == (2, 4410)
     assert float(np.max(np.abs(decoded[0]))) > 0.9
     assert float(np.max(np.abs(decoded[1]))) < 0.6
+
+
+def test_library_folder_picker_list_and_remove(tmp_path: Path):
+    music_dir = tmp_path / "my_songs"
+    music_dir.mkdir()
+    _make_wav(music_dir / "demo.wav", frames=800)
+
+    client = _client(folder_picker_fn=lambda: str(music_dir))
+    picked = client.post("/library/pick-folder")
+    assert picked.status_code == 200
+    assert Path(picked.json()["path"]).resolve() == music_dir.resolve()
+
+    assert client.post("/library/select", json={"path": picked.json()["path"]}).status_code == 200
+    folders = client.get("/library/folders").json()["folders"]
+    assert len(folders) == 1
+    assert Path(folders[0]).resolve() == music_dir.resolve()
+
+    removed = client.request("DELETE", "/library/folders", json={"path": folders[0]})
+    assert removed.status_code == 200
+    assert removed.json()["folders"] == []

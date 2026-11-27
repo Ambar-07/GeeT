@@ -26,10 +26,13 @@ import {
   clearSongCache,
   fetchHostHealth,
   fetchJob,
+  fetchLibraryFolders,
   fetchSong,
   fetchSongsPage,
   mediaUrl,
+  pickLibraryFolder,
   prepareSong,
+  removeLibraryFolder,
   scanLibrary,
   selectLibraryFolder,
 } from "../lib/hostAgent";
@@ -91,6 +94,8 @@ export function HostPage() {
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [folderPath, setFolderPath] = useState("");
+  const [libraryFolders, setLibraryFolders] = useState<string[]>([]);
+  const [pickingFolder, setPickingFolder] = useState(false);
   const [query, setQuery] = useState("");
   const [songs, setSongs] = useState<HostSong[]>([]);
   const [featuredSongs, setFeaturedSongs] = useState<HostSong[]>([]);
@@ -315,12 +320,17 @@ export function HostPage() {
     const version = ++requestVersionRef.current;
     setLibraryLoading(true);
     try {
-      const [h, page] = await Promise.all([fetchHostHealth(), fetchSongsPage(searchQuery)]);
+      const [h, page, folders] = await Promise.all([
+        fetchHostHealth(),
+        fetchSongsPage(searchQuery),
+        fetchLibraryFolders().catch(() => []),
+      ]);
       if (version !== requestVersionRef.current || searchQuery !== queryRef.current) return;
       setHealth(h);
       setHealthError(null);
       setSongs(page.songs);
       setNextCursor(page.next_cursor);
+      setLibraryFolders(folders);
     } catch (err) {
       if (version !== requestVersionRef.current || searchQuery !== queryRef.current) return;
       setHealth(null);
@@ -790,20 +800,60 @@ export function HostPage() {
     }
   }
 
-  async function handleAddAndScan(e: React.FormEvent) {
-    e.preventDefault();
-    if (!folderPath.trim() || scanning) return;
+  async function addAndScanPath(targetPath: string) {
+    const clean = targetPath.trim();
+    if (!clean || scanning) return;
     setScanning(true);
     setStatusMsg("Scanning folder...");
     try {
-      await selectLibraryFolder(folderPath.trim());
+      await selectLibraryFolder(clean);
       const res = await scanLibrary();
       shufflePoolRef.current = [];
       shuffleBagRef.current = [];
+      setFolderPath("");
       setStatusMsg(`Imported ${res.scanned + res.skipped_unchanged} tracks.`);
       await refresh();
     } catch (err) {
       setStatusMsg(err instanceof Error ? err.message : "Scan failed");
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function handleAddAndScan(e: React.FormEvent) {
+    e.preventDefault();
+    await addAndScanPath(folderPath);
+  }
+
+  async function handleBrowseFolder() {
+    if (!health || scanning || pickingFolder) return;
+    setPickingFolder(true);
+    try {
+      const picked = await pickLibraryFolder();
+      if (picked) {
+        setFolderPath(picked);
+        await addAndScanPath(picked);
+      }
+    } catch (err) {
+      setStatusMsg(err instanceof Error ? err.message : "Could not open folder picker");
+    } finally {
+      setPickingFolder(false);
+    }
+  }
+
+  async function handleRemoveFolder(targetPath: string) {
+    if (!health || scanning) return;
+    setScanning(true);
+    setStatusMsg("Updating library...");
+    try {
+      await removeLibraryFolder(targetPath);
+      await scanLibrary();
+      shufflePoolRef.current = [];
+      shuffleBagRef.current = [];
+      setStatusMsg("Folder removed from library.");
+      await refresh();
+    } catch (err) {
+      setStatusMsg(err instanceof Error ? err.message : "Could not remove folder");
     } finally {
       setScanning(false);
     }
@@ -957,13 +1007,23 @@ export function HostPage() {
                   </div>
 
                   <form onSubmit={handleAddAndScan} className="space-y-2">
-                    <label className="block text-[11px] text-white/55">Music Folder</label>
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="block text-[11px] text-white/55">Music Folders</label>
+                      <button
+                        type="button"
+                        disabled={!health || scanning || pickingFolder}
+                        onClick={() => void handleBrowseFolder()}
+                        className="rounded-full bg-white/10 px-2.5 py-0.5 text-[10px] font-medium text-white/85 transition hover:bg-white/18 hover:text-white disabled:opacity-40"
+                      >
+                        {pickingFolder ? "Choosing…" : "Browse…"}
+                      </button>
+                    </div>
                     <div className="flex gap-1.5">
                       <input
                         aria-label="Local music folder path"
                         value={folderPath}
                         onChange={(e) => setFolderPath(e.target.value)}
-                        placeholder="D:\Music"
+                        placeholder="Choose or paste folder path"
                         className="field py-1.5 text-xs"
                       />
                       <button
@@ -974,6 +1034,29 @@ export function HostPage() {
                         {scanning ? "Scanning…" : "Add & Scan"}
                       </button>
                     </div>
+                    {libraryFolders.length > 0 && (
+                      <ul className="max-h-24 space-y-1 overflow-y-auto pt-1">
+                        {libraryFolders.map((dir) => (
+                          <li
+                            key={dir}
+                            className="flex items-center justify-between gap-2 rounded-lg bg-white/[0.04] px-2.5 py-1 text-[10px] text-white/70"
+                          >
+                            <span className="truncate font-mono" title={dir}>
+                              {dir}
+                            </span>
+                            <button
+                              type="button"
+                              disabled={scanning}
+                              aria-label={`Remove folder ${dir}`}
+                              onClick={() => void handleRemoveFolder(dir)}
+                              className="shrink-0 text-white/40 transition hover:text-pink disabled:opacity-40"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </form>
 
                   <div className="flex items-center justify-between border-t border-white/8 pt-3">
@@ -1237,20 +1320,30 @@ export function HostPage() {
                   {healthError && <button type="button" className="btn-ghost px-4 py-2" onClick={() => void refresh()}>Reconnect</button>}
                   {!query && !favoritesOnly && !libraryLoading && !healthError && !settingsOpen && (
                     <form onSubmit={handleAddAndScan} className="w-full space-y-2">
+                      <button
+                        type="button"
+                        disabled={!health || scanning || pickingFolder}
+                        onClick={() => void handleBrowseFolder()}
+                        className="btn-primary w-full py-2 text-xs"
+                      >
+                        {pickingFolder ? "Opening Folder Picker…" : "Choose Music Folder…"}
+                      </button>
                       <input
                         aria-label="Local music folder path"
                         value={folderPath}
                         onChange={(e) => setFolderPath(e.target.value)}
-                        placeholder="D:\Music"
+                        placeholder="Or paste folder path"
                         className="field py-1.5 text-center text-xs"
                       />
-                      <button
-                        type="submit"
-                        disabled={!health || scanning || !folderPath.trim()}
-                        className="btn-light w-full py-2 text-xs"
-                      >
-                        {scanning ? "Scanning…" : "Add & Scan"}
-                      </button>
+                      {folderPath.trim() && (
+                        <button
+                          type="submit"
+                          disabled={!health || scanning}
+                          className="btn-light w-full py-2 text-xs"
+                        >
+                          {scanning ? "Scanning…" : "Add & Scan"}
+                        </button>
+                      )}
                     </form>
                   )}
                 </div>
