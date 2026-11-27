@@ -69,8 +69,24 @@ export function selectNextAutoPrepareCandidate(
   return null;
 }
 
+const FAVORITES_STORAGE_KEY = "geet_favorite_songs";
+
+function loadFavoriteIds(): Set<string> {
+  // shortcut: favorites are stored in browser localStorage; move to host SQLite if multi-device sync is needed
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.filter((v): v is string => typeof v === "string")) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
 export function HostPage() {
   const [health, setHealth] = useState<HostHealth | null>(null);
+  const [favoriteIds, setFavoriteIds] = useState<Set<string>>(loadFavoriteIds);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [folderPath, setFolderPath] = useState("");
   const [query, setQuery] = useState("");
@@ -142,6 +158,24 @@ export function HostPage() {
   songsRef.current = songs;
 
   const songsById = useMemo(() => new Map(songs.map((s) => [s.id, s])), [songs]);
+  const visibleSongs = useMemo(
+    () => (favoritesOnly ? songs.filter((s) => favoriteIds.has(s.id)) : songs),
+    [songs, favoritesOnly, favoriteIds]
+  );
+
+  const toggleFavorite = useCallback((songId: string) => {
+    setFavoriteIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(songId)) next.delete(songId);
+      else next.add(songId);
+      try {
+        localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(Array.from(next)));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return next;
+    });
+  }, []);
 
   const handlePlayHostSong = useCallback(async (hostSongId: string) => {
     const local = songsRef.current.find((s) => s.id === hostSongId);
@@ -810,12 +844,9 @@ export function HostPage() {
           aria-hidden={tvMode}
           className={`${
             tvMode ? "hidden" : "flex"
-          } host-sidebar w-full shrink-0 flex-col border-b border-white/[0.06] bg-ink-900/95 p-4 lg:h-full lg:w-[310px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
+          } host-sidebar w-full shrink-0 flex-col border-b border-white/[0.06] bg-ink-900/95 p-3.5 lg:h-full lg:w-[310px] lg:overflow-hidden lg:border-b-0 lg:border-r`}
         >
-          <div className="mb-5 flex items-center justify-between px-1">
-            <div><p className="eyebrow mb-1">Your collection</p><h1 className="text-lg font-semibold tracking-tight">Let’s hear it.</h1></div>
-            <button type="button" onClick={() => setSettingsOpen(true)} aria-label="Add music folder" className="btn-ghost h-10 w-10 text-xl">+</button>
-          </div>
+          <h1 className="sr-only">GeeT Studio</h1>
           {/* Segmented Library / Party Switch */}
           <div
             role="tablist"
@@ -940,6 +971,23 @@ export function HostPage() {
 
               <button
                 type="button"
+                aria-pressed={favoritesOnly}
+                aria-label="Filter favorite songs"
+                title={favoritesOnly ? "Show all songs" : "Show favorites only"}
+                onClick={() => setFavoritesOnly((v) => !v)}
+                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition ${
+                  favoritesOnly
+                    ? "border-pink/40 bg-pink/15 text-pink"
+                    : "border-white/12 bg-white/[0.05] text-white/70 hover:bg-white/10 hover:text-white"
+                }`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill={favoritesOnly ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+                </svg>
+              </button>
+
+              <button
+                type="button"
                 disabled={songs.length === 0}
                 onClick={() => void handleShufflePlay()}
                 aria-label="Shuffle play library"
@@ -962,13 +1010,26 @@ export function HostPage() {
 
             {/* Full-Height Spacious Tracklist */}
             <div aria-busy={libraryLoading} className="library-scroll thin-scroll min-h-0 flex-1 overflow-y-auto pr-0.5">
-              {songs.length === 0 ? (
+              {visibleSongs.length === 0 ? (
                 <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center">
                   <p className="text-xs font-semibold text-white/75">
-                    {libraryLoading ? "Loading your music…" : healthError ? "Host agent is offline" : query ? "No matching songs" : "Add your music folder"}
+                    {libraryLoading
+                      ? "Loading your music…"
+                      : healthError
+                        ? "Host agent is offline"
+                        : favoritesOnly
+                          ? "No favorite songs yet"
+                          : query
+                            ? "No matching songs"
+                            : "Add your music folder"}
                   </p>
+                  {favoritesOnly && (
+                    <button type="button" className="btn-ghost px-4 py-1.5 text-xs" onClick={() => setFavoritesOnly(false)}>
+                      Show all songs
+                    </button>
+                  )}
                   {healthError && <button type="button" className="btn-ghost px-4 py-2" onClick={() => void refresh()}>Reconnect</button>}
-                  {!query && !libraryLoading && !healthError && !settingsOpen && (
+                  {!query && !favoritesOnly && !libraryLoading && !healthError && !settingsOpen && (
                     <form onSubmit={handleAddAndScan} className="w-full space-y-2">
                       <input
                         aria-label="Local music folder path"
@@ -989,8 +1050,9 @@ export function HostPage() {
                 </div>
               ) : (
                 <ul className="space-y-0.5">
-                  {songs.map((song) => {
+                  {visibleSongs.map((song) => {
                     const isActive = activeSong?.id === song.id;
+                    const isFav = favoriteIds.has(song.id);
                     const cleanTitle = displayTitle(song.title);
                     const subLabel = song.artist || song.album || "";
                     return (
@@ -1029,6 +1091,22 @@ export function HostPage() {
                         </button>
 
                         <div className="flex shrink-0 items-center gap-1">
+                          <button
+                            type="button"
+                            aria-label={isFav ? `Remove ${cleanTitle} from favorites` : `Favorite ${cleanTitle}`}
+                            aria-pressed={isFav}
+                            title={isFav ? "Remove from favorites" : "Favorite"}
+                            onClick={() => toggleFavorite(song.id)}
+                            className={`flex h-7 w-7 items-center justify-center rounded-full transition ${
+                              isFav
+                                ? "text-pink"
+                                : "text-white/40 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-white/10 hover:text-white"
+                            }`}
+                          >
+                            <svg width="11" height="11" viewBox="0 0 24 24" fill={isFav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+                              <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+                            </svg>
+                          </button>
                           {song.has_instrumental && (
                             <span
                               title="Instrumental ready"
@@ -1558,21 +1636,19 @@ export function HostPage() {
             </div>
           ) : (
             /* Clean Real-Library Quick Launch Grid (No Placeholders) */
-            <div className="relative z-10 mx-auto my-auto w-full max-w-5xl space-y-7">
-              {!tvMode && <div className="library-welcome">
-                <p className="eyebrow text-rose-200/70">Set the mood. Take the mic.</p>
-                <h2 className="mt-3 text-3xl font-bold tracking-[-0.04em] sm:text-5xl">Your next encore<br /><span className="text-rose-200">starts here.</span></h2>
-                <p className="mt-4 max-w-md text-sm leading-6 text-white/60">Pick a favourite, warm up your vocals, and make the room yours.</p>
-                <div className="mt-6 flex flex-wrap gap-2">
-                  <button type="button" onClick={() => { setSidebarTab("party"); if (window.innerWidth < 1024) document.getElementById("host-sidebar")?.scrollIntoView({ behavior: "smooth" }); }} className="btn-primary px-5 py-2.5">Open party room <span aria-hidden="true">↗</span></button>
-                  <button type="button" onClick={() => setSettingsOpen(true)} className="btn-ghost px-5 py-2.5">Add music</button>
-                </div>
-              </div>}
+            <div className="relative z-10 mx-auto my-auto w-full max-w-5xl space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <h2 className="text-2xl font-bold tracking-[-0.03em] text-white sm:text-3xl">
-                  {query ? "Search results" : "Made for an encore"}
-                </h2>
-                <div className="flex items-center gap-2">
+                <div>
+                  <h2 className="text-2xl font-bold tracking-[-0.03em] text-white sm:text-3xl">
+                    {query ? "Search results" : "Your Library"}
+                  </h2>
+                  {!query && health && health.song_count > 0 && (
+                    <p className="mt-1 text-xs text-white/45">
+                      Tap any track to start singing · {health.song_count} songs ready
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
                   {songs.length > 8 && (
                     <button
                       type="button"
@@ -1601,6 +1677,20 @@ export function HostPage() {
                         <path d="m18 14 4 4-4 4" />
                       </svg>
                       <span>Shuffle</span>
+                    </button>
+                  )}
+                  {!tvMode && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSidebarTab("party");
+                        if (window.innerWidth < 1024) {
+                          document.getElementById("host-sidebar")?.scrollIntoView({ behavior: "smooth" });
+                        }
+                      }}
+                      className="btn-ghost px-4 py-2 text-xs font-medium text-white/85"
+                    >
+                      Party Room
                     </button>
                   )}
                   {stageRoom?.playNext && (

@@ -55,9 +55,6 @@ button:disabled { cursor: not-allowed; }
 }
 .host-shell > header { min-height: 70px; }
 .host-sidebar { position: relative; z-index: 20; }
-.library-welcome { position: relative; overflow: hidden; border: 1px solid #ffffff12; border-radius: 20px; padding: clamp(24px, 3vw, 40px); background: radial-gradient(ellipse at 100% 10%, #b54f6950, transparent 65%), linear-gradient(115deg, #241c25, #18151c); }
-.library-welcome::after { content: "♪"; position: absolute; right: 5%; top: -35px; font-size: 280px; line-height: 1; color: #f5adb514; transform: rotate(-16deg); pointer-events: none; }
-.library-welcome > * { position: relative; z-index: 1; }
 .karaoke-stage { scroll-padding-block: 32px; }
 .track-row:focus-within { background-color: #ffffff0d; }
 .album-card:focus-visible { transform: translateY(-3px); }
@@ -128,7 +125,7 @@ button:disabled { cursor: not-allowed; }
 }
 
 :focus-visible {
-  outline: 2px solid var(--color-sky);
+  outline: 2px solid rgba(255, 255, 255, 0.72);
   outline-offset: 2px;
 }
 

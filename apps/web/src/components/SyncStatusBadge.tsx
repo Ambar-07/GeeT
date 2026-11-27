@@ -17,9 +17,9 @@ export function SyncStatusBadge({
   const config =
     state === "subscribed"
       ? {
-          dot: "bg-sky shadow-[0_0_8px_rgba(5,147,198,0.85)]",
+          dot: "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]",
           text: compact ? "Live" : `${prefix}Live`,
-          tone: "border-sky/30 bg-sky/10 text-sky",
+          tone: "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
         }
       : state === "connecting"
         ? {

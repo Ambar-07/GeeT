@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Logo } from "../components/Brand";
-import { Cover, displayTitle } from "../components/Cover";
+import { Cover, StageBackdrop, displayTitle } from "../components/Cover";
 import { GuestLyricsCard } from "../components/GuestLyricsCard";
 import {
   SyncStatusBadge,
@@ -207,6 +207,10 @@ export function RoomPage() {
   );
 
   const queuedEntries = (snapshot?.queue ?? []).filter((q) => q.status === "queued");
+  const queuedSongIds = useMemo(
+    () => new Set(queuedEntries.map((q) => q.song_id)),
+    [queuedEntries]
+  );
   const playingEntry = (snapshot?.queue ?? []).find((q) => q.status === "playing") ?? null;
   const playingSong = snapshot?.playback?.song_id
     ? songMap.get(snapshot.playback.song_id) ?? null
@@ -406,37 +410,43 @@ export function RoomPage() {
 
   if (!roomId) {
     return (
-      <div className="stage-ambient min-h-screen text-snow">
-        <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-          <div className="surface p-7 space-y-6 shadow-2xl">
+      <div className="home-shell relative min-h-dvh overflow-hidden text-snow">
+        <div className="pointer-events-none fixed inset-0 z-0" aria-hidden="true">
+          <StageBackdrop title={normalizedCode || null} playing={true} />
+          <div className="absolute inset-0 bg-[#08060e]/75" />
+        </div>
+        <main className="relative z-10 mx-auto flex min-h-dvh max-w-md flex-col justify-center px-5 py-10">
+          <div className="space-y-6 rounded-3xl border border-white/14 bg-[#0d0a14]/78 p-7 shadow-[0_24px_70px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
             <div className="flex items-center justify-between gap-2">
-              <Logo size={26} suffix="Join" />
-              <span className="rounded-full border border-white/12 bg-white/[0.04] px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-snow/60">
+              <Logo size={26} suffix="Party" />
+              <span className="rounded-full border border-white/12 bg-white/[0.06] px-3 py-1 font-mono text-[10px] uppercase tracking-wider text-white/70">
                 {isSupabaseConfigured ? "Cloud / LAN" : "LAN Wi-Fi"}
               </span>
             </div>
             <div>
               <p className="eyebrow">Room Code</p>
-              <h1 className="mt-1 font-mono text-2xl font-bold tracking-wider text-snow">
+              <h1 className="mt-1 font-mono text-3xl font-bold tracking-[0.14em] text-white">
                 {normalizedCode}
               </h1>
             </div>
             <form onSubmit={handleJoin} className="space-y-3">
-              <p className="text-sm leading-6 text-white/60">You’re on the guest list. Choose a name, queue your favourites, and sing along.</p>
+              <p className="text-sm leading-relaxed text-white/65">
+                Pick a display name to queue tracks and sing along on your phone.
+              </p>
               <input
                 aria-label="Your display name"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Your display name"
                 maxLength={40}
-                className="field"
+                className="field bg-white/[0.07]"
               />
               <button
                 type="submit"
                 disabled={joining || !displayName.trim()}
-                className="btn-primary w-full py-2.5 text-sm"
+                className="btn-primary w-full py-3 text-sm"
               >
-                {joining ? "Joining..." : "Enter Room"}
+                {joining ? "Joining…" : "Enter Room"}
               </button>
             </form>
             {error && (
@@ -444,12 +454,12 @@ export function RoomPage() {
                 {error}
               </p>
             )}
-            <div className="flex items-center justify-between pt-1 text-xs">
-              <Link to="/" className="text-snow/50 hover:text-snow">
-                Back to Home
+            <div className="flex items-center justify-between border-t border-white/8 pt-4 text-xs">
+              <Link to="/" className="text-white/55 transition hover:text-white">
+                ← Home
               </Link>
-              <Link to="/host" className="text-sky/80 hover:text-sky">
-                Host Console →
+              <Link to="/host" className="text-white/75 transition hover:text-white">
+                Host Console ↗
               </Link>
             </div>
           </div>
@@ -458,15 +468,32 @@ export function RoomPage() {
     );
   }
 
+  const playingCoverSrc =
+    playingSong && transport === "lan" && roomId
+      ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
+      : undefined;
+
   return (
-    <div className="stage-ambient min-h-dvh text-snow">
-      <main className="mx-auto max-w-2xl space-y-4 px-4 py-6 sm:px-5">
-        <header className="surface flex items-center justify-between gap-2 px-4 py-3 sm:px-5">
+    <div className="home-shell relative min-h-dvh overflow-x-hidden text-snow">
+      {/* Live subtle album-art ambient glow matching the TV stage */}
+      <div className="pointer-events-none fixed inset-0 z-0" aria-hidden="true">
+        <StageBackdrop
+          coverSrc={playingCoverSrc}
+          hasCover={Boolean(playingCoverSrc)}
+          title={playingSong?.title ?? normalizedCode}
+          playing={playbackClock.status === "playing"}
+        />
+        <div className="absolute inset-0 bg-[#09070f]/78" />
+      </div>
+
+      <main className="relative z-10 mx-auto max-w-2xl space-y-4 px-4 pb-10 pt-4 sm:px-5">
+        {/* Sticky floating frosted-glass pill header */}
+        <header className="sticky top-3 z-30 flex items-center justify-between gap-2 rounded-full border border-white/14 bg-[#0d0a15]/78 py-1.5 pl-3.5 pr-1.5 shadow-[0_12px_36px_rgba(0,0,0,0.5)] backdrop-blur-2xl">
           <div className="flex min-w-0 items-center gap-2.5">
             <Logo size={22} />
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <p className="font-mono text-xs font-semibold tracking-wider text-white/90">
+              <div className="flex items-center gap-1.5">
+                <p className="font-mono text-xs font-semibold tracking-wider text-white">
                   {normalizedCode}
                 </p>
                 <button
@@ -478,24 +505,27 @@ export function RoomPage() {
                   <SyncStatusBadge state={connState} transport={transport} />
                 </button>
               </div>
-              <h1 className="truncate text-[11px] font-medium text-white/50">
-                {snapshot ? `${onlineIds.length} online` : "Loading..."}
+              <h1 className="truncate text-[10px] font-medium text-white/55">
+                {snapshot ? `${onlineIds.length} online · ${queuedEntries.length} queued` : "Loading…"}
               </h1>
             </div>
           </div>
-          <Link to="/" className="btn-ghost shrink-0 px-3.5 py-1.5 text-xs">
+          <Link
+            to="/"
+            className="inline-flex h-8 shrink-0 items-center rounded-full bg-white/[0.1] px-3.5 text-xs font-medium text-white/85 ring-1 ring-inset ring-white/10 transition hover:bg-white/[0.16] hover:text-white"
+          >
             Leave
           </Link>
         </header>
 
         {snapshot?.room.status === "host_disconnected" && (
-          <div role="status" className="surface border-pink/40 p-3.5 text-xs text-pink">
+          <div role="status" className="surface border-pink/40 bg-black/45 p-3.5 text-xs text-pink">
             Host is temporarily paused. Waiting for host to resume.
           </div>
         )}
 
         {snapshot?.room.status === "closed" && (
-          <div role="alert" className="surface border-pink/60 p-3.5 text-xs text-pink">
+          <div role="alert" className="surface border-pink/60 bg-black/45 p-3.5 text-xs text-pink">
             This room has ended.
           </div>
         )}
@@ -503,16 +533,16 @@ export function RoomPage() {
         {isMyTurnNow && playingSong && (
           <div
             role="status"
-            className="surface flex flex-wrap items-center justify-between gap-3 border-pink/55 bg-pink/15 px-4 py-3 text-xs text-snow shadow-[0_0_24px_rgba(241,105,137,0.18)]"
+            className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#fa2d48]/55 bg-[#fa2d48]/16 px-4 py-3 text-xs text-white shadow-[0_8px_32px_rgba(250,45,72,0.22)] backdrop-blur-xl"
           >
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <span className="h-2 w-2 animate-ping rounded-full bg-pink" />
-                <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-pink">
+                <span className="h-2 w-2 animate-ping rounded-full bg-[#fa2d48]" />
+                <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-[#ff7a98]">
                   You&apos;re On Stage Now! 🎤
                 </span>
               </div>
-              <p className="mt-0.5 truncate font-semibold text-snow">
+              <p className="mt-0.5 truncate font-semibold text-white">
                 {displayTitle(playingSong.title)}
                 {playingSong.artist ? ` — ${playingSong.artist}` : ""}
               </p>
@@ -520,7 +550,7 @@ export function RoomPage() {
             <button
               type="button"
               onClick={() => setLyricsFullscreen(true)}
-              className="btn-primary shrink-0 px-3.5 py-1.5 text-[11px]"
+              className="btn-primary shrink-0 px-4 py-1.5 text-[11px]"
             >
               Sing-Along Lyrics
             </button>
@@ -530,27 +560,28 @@ export function RoomPage() {
         {myNextSong && (
           <div
             role="status"
-            className={`surface px-4 py-3 text-xs text-snow ${myNextQueueIdx === 0
-              ? "border-sky/60 bg-sky/15 shadow-[0_0_22px_rgba(5,147,198,0.18)]"
-              : "border-sky/35 bg-sky/10"
-              }`}
+            className={`rounded-2xl border px-4 py-3 text-xs text-white backdrop-blur-xl ${
+              myNextQueueIdx === 0
+                ? "border-white/25 bg-white/[0.1] shadow-[0_8px_28px_rgba(0,0,0,0.3)]"
+                : "border-white/12 bg-white/[0.05]"
+            }`}
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-wider text-sky">
+              <span className="flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[#ff7a98]">
                 {myNextQueueIdx === 0 && (
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-sky" />
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-[#fa2d48]" />
                 )}
                 {myNextQueueIdx === 0
                   ? "You're Up Next!"
                   : `Your Turn: #${myNextQueueIdx + 1} in queue`}
               </span>
               {myNextQueueIdx === 0 && (
-                <span className="rounded-full bg-sky/20 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-sky">
+                <span className="rounded-full bg-[#fa2d48]/20 px-2.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-[#ff8da6]">
                   Get Ready
                 </span>
               )}
             </div>
-            <p className="mt-0.5 font-semibold text-snow">
+            <p className="mt-0.5 font-semibold text-white">
               {displayTitle(myNextSong.title)}
               {myNextSong.artist ? ` — ${myNextSong.artist}` : ""}
             </p>
@@ -558,20 +589,16 @@ export function RoomPage() {
         )}
 
         {playingSong && (
-          <section className="surface stage-ambient p-4 sm:p-5">
-            <div className="flex items-center gap-4">
+          <section className="rounded-3xl border border-white/12 bg-black/38 p-4 shadow-[0_16px_48px_rgba(0,0,0,0.4)] backdrop-blur-2xl sm:p-5">
+            <div className="flex items-center gap-3.5">
               <Cover
                 title={playingSong.title}
-                coverSrc={
-                  transport === "lan" && roomId
-                    ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
-                    : undefined
-                }
+                coverSrc={playingCoverSrc}
                 size={52}
-                className="rounded-xl shadow-md"
+                className="rounded-xl shadow-md ring-1 ring-white/15"
               />
               <div className="min-w-0 flex-1">
-                <p className="text-[11px] font-semibold text-white/55">
+                <p className="text-[11px] font-semibold text-white/60">
                   {snapshot?.playback?.status === "paused" ? "Paused" : "Now Playing"}
                   {playingEntry
                     ? ` · ${participantMap.get(playingEntry.requested_by) ?? "Guest"}`
@@ -588,11 +615,7 @@ export function RoomPage() {
               songTitle={playingSong.title}
               songArtist={playingSong.artist}
               durationMs={playingSong.duration_ms}
-              coverSrc={
-                transport === "lan" && roomId
-                  ? `/lan-api/rooms/${encodeURIComponent(roomId)}/cover/${encodeURIComponent(playingSong.host_song_id)}`
-                  : undefined
-              }
+              coverSrc={playingCoverSrc}
               lrcText={
                 guestLyrics?.hostSongId === playingSong.host_song_id ? guestLyrics.lrcText : ""
               }
@@ -611,29 +634,57 @@ export function RoomPage() {
           </section>
         )}
 
+        {/* Compact single-row Cheer Bar */}
+        <section className="rounded-2xl border border-white/10 bg-black/35 p-3.5 backdrop-blur-xl sm:px-4">
+          <div className="mb-2.5 flex items-center justify-between gap-2">
+            <span className="eyebrow">Cheer the Singer</span>
+            {recentReactions.length > 0 && (
+              <span className="truncate font-mono text-[10px] text-[#ff7a98]">
+                {recentReactions[0].sender}: {recentReactions[0].label}
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-4 gap-1.5 sm:gap-2">
+            {REACTION_BUTTONS.map(({ label, icon }) => (
+              <button
+                key={label}
+                type="button"
+                disabled={reactionCooldown}
+                onClick={() => handleSendReaction(label)}
+                className="btn-ghost min-h-[38px] px-2 py-1.5 text-[11px] sm:text-xs"
+              >
+                <span aria-hidden="true">{icon}</span>
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+
         {queuedEntries.length > 0 && (
-          <section className="surface p-4 sm:p-5 space-y-3">
+          <section className="space-y-3 rounded-2xl border border-white/10 bg-black/35 p-4 backdrop-blur-xl sm:p-5">
             <h2 className="text-sm font-semibold text-white">Up Next ({queuedEntries.length})</h2>
-            <ul className="divide-y divide-white/6">
+            <ul className="divide-y divide-white/[0.06]">
               {queuedEntries.map((entry, idx) => {
                 const s = songMap.get(entry.song_id);
                 const requester = participantMap.get(entry.requested_by) ?? "Guest";
                 const isMine = entry.requested_by === userId;
                 return (
                   <li key={entry.id} className="flex items-center justify-between gap-2 py-2.5 text-xs">
-                    <div className="min-w-0 truncate">
-                      <span className="mr-2 font-mono text-white/40">{idx + 1}.</span>
-                      <span className="font-semibold text-white">
-                        {s ? displayTitle(s.title) : "Song"}
-                      </span>
-                      <span className="ml-2 text-white/50">({requester})</span>
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <span className="w-5 shrink-0 font-mono text-white/40">{idx + 1}.</span>
+                      <div className="min-w-0">
+                        <p className="truncate font-semibold text-white">
+                          {s ? displayTitle(s.title) : "Song"}
+                        </p>
+                        <p className="truncate text-[11px] text-white/50">{requester}</p>
+                      </div>
                     </div>
                     {isMine && (
                       <button
                         type="button"
                         disabled={queueBusyId === entry.id}
                         onClick={() => void handleRemoveOwnEntry(entry.id)}
-                        className="shrink-0 text-xs font-medium text-pink hover:underline disabled:opacity-40"
+                        className="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium text-[#ff6b8b] transition hover:bg-white/10 disabled:opacity-40"
                       >
                         Remove
                       </button>
@@ -645,33 +696,8 @@ export function RoomPage() {
           </section>
         )}
 
-        <section className="surface space-y-2.5 p-4 sm:p-5">
-          <div className="flex items-center justify-between">
-            <span className="eyebrow">Cheer the Singer</span>
-            {recentReactions.length > 0 && (
-              <span className="truncate font-mono text-[10px] text-pink/90">
-                {recentReactions[0].sender}: {recentReactions[0].label}
-              </span>
-            )}
-          </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {REACTION_BUTTONS.map(({ label, icon }) => (
-              <button
-                key={label}
-                type="button"
-                disabled={reactionCooldown}
-                onClick={() => handleSendReaction(label)}
-                className="btn-ghost py-2 text-xs"
-              >
-                <span aria-hidden="true">{icon}</span>
-                <span>{label}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="surface p-4 sm:p-5 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
+        <section className="space-y-4 rounded-2xl border border-white/10 bg-black/35 p-4 backdrop-blur-xl sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
             <h2 className="text-sm font-semibold text-snow">
               Room Catalogue ({filteredSongs.length})
             </h2>
@@ -679,17 +705,22 @@ export function RoomPage() {
               aria-label="Search room songs"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search songs..."
-              className="field max-w-xs py-1.5 text-xs"
+              placeholder="Search songs…"
+              className="field max-w-xs bg-white/[0.07] py-1.5 text-xs"
             />
           </div>
 
           {filteredSongs.length === 0 ? (
-            <p className="py-5 text-sm text-snow/60">{search.trim() ? "No songs match your search. Try another title or artist." : "The host hasn’t shared any songs yet. They’ll appear here when the library is ready."}</p>
+            <p className="py-5 text-sm text-snow/60">
+              {search.trim()
+                ? "No songs match your search. Try another title or artist."
+                : "The host hasn’t shared any songs yet. They’ll appear here when the library is ready."}
+            </p>
           ) : (
-            <ul className="divide-y divide-white/6">
+            <ul className="divide-y divide-white/[0.06]">
               {filteredSongs.map((song) => {
                 const isJustQueued = justQueuedId === song.id;
+                const alreadyInQueue = queuedSongIds.has(song.id);
                 return (
                   <li key={song.id} className="flex items-center justify-between gap-3 py-2.5 text-sm">
                     <div className="flex min-w-0 items-center gap-3">
@@ -708,7 +739,7 @@ export function RoomPage() {
                           {displayTitle(song.title)}
                         </p>
                         {song.artist && (
-                          <p className="truncate text-xs text-white/45">{song.artist}</p>
+                          <p className="truncate text-xs text-white/50">{song.artist}</p>
                         )}
                       </div>
                     </div>
@@ -716,14 +747,21 @@ export function RoomPage() {
                       type="button"
                       disabled={snapshot?.room.status !== "open" || queueBusyId === song.id}
                       onClick={() => void handleQueueSong(song.id)}
-                      className={`${isJustQueued ? "btn-light" : "btn-ghost hover:border-white/35"
-                        } shrink-0 px-3.5 py-1.5 text-xs font-semibold`}
+                      className={`${
+                        isJustQueued
+                          ? "btn-light"
+                          : alreadyInQueue
+                            ? "btn-ghost border-[#fa2d48]/40 bg-[#fa2d48]/12 text-[#ff8da6]"
+                            : "btn-ghost hover:border-white/35"
+                      } shrink-0 px-3.5 py-1.5 text-xs font-semibold`}
                     >
                       {queueBusyId === song.id
-                        ? "Adding..."
+                        ? "Adding…"
                         : isJustQueued
                           ? "Queued ✓"
-                          : "Queue"}
+                          : alreadyInQueue
+                            ? "+ Again"
+                            : "Queue"}
                     </button>
                   </li>
                 );

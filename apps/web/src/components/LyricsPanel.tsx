@@ -23,7 +23,6 @@ interface LyricsPanelProps {
   onLyricsChange?: (data: { songId: string; lrcText: string; offsetMs: number }) => void;
 }
 
-const OFFSET_STEPS = [-1000, -500, -100, 100, 500, 1000] as const;
 const ROMANIZE_STORAGE_KEY = "geet_romanize_lyrics";
 
 // Avoid repeating automatic LRCLIB network lookups for the same song in one session
@@ -579,27 +578,7 @@ export function LyricsPanel({
         </div>
       )}
 
-      {/* Apple Music–style Bottom-Right Transliteration Toggle (visible when Devanagari lyrics are present) */}
-      {hasNonLatin && (
-        <button
-          type="button"
-          onClick={toggleRomanize}
-          aria-pressed={romanize}
-          aria-label="Toggle Hinglish transliteration"
-          title={romanize ? "Hide Hinglish pronunciation" : "Show Hinglish pronunciation"}
-          className={`absolute bottom-14 right-3 z-20 flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold backdrop-blur-md transition lg:right-8 ${
-            romanize
-              ? "border-white/40 bg-white text-ink-950 shadow-lg"
-              : "border-white/18 bg-black/40 text-white/80 hover:bg-black/60 hover:text-white"
-          }`}
-        >
-          <span className="leading-none">अ</span>
-          <span className="opacity-50">/</span>
-          <span className="font-mono text-[11px] leading-none">A</span>
-        </button>
-      )}
-
-      {/* Discreet Hover-Revealed Calibration & Editor Bar */}
+      {/* Discreet Hover-Revealed Sync, Transliteration & Editor Pill */}
       <div
         className={`lyrics-dock mt-2 space-y-2.5 transition-opacity duration-200 lg:px-8 ${
           editing || showSyncDock || msg || autoFetching
@@ -607,65 +586,97 @@ export function LyricsPanel({
             : "opacity-0 group-hover/lyrics:opacity-100 focus-within:opacity-100"
         }`}
       >
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-full border border-white/12 bg-black/45 px-3.5 py-1.5 backdrop-blur-md">
-          <div className="flex items-center gap-2 text-[11px] text-white/70">
-            <span className="sr-only">Lyrics</span>
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                autoFetching ? "animate-pulse bg-sky" : syncReady ? "bg-sky" : "bg-pink"
-              }`}
-            />
-            <span className="font-mono text-[10px] uppercase tracking-wider">
-              {autoFetching
-                ? "syncing lrclib..."
-                : syncReady
-                  ? `${source}`
-                  : plainLines.length > 0
-                    ? "embedded"
-                    : "unsynced"}{" "}
-              · {offsetMs >= 0 ? `+${offsetMs}` : offsetMs}ms
-            </span>
-          </div>
-
+        <div className="inline-flex items-center gap-1 rounded-full border border-white/[0.14] bg-black/50 p-1 shadow-[0_10px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
           <div
-            className="flex flex-wrap items-center gap-1"
+            className="flex items-center gap-0.5"
             role="group"
             aria-label="Lyrics offset calibration"
           >
-            {OFFSET_STEPS.map((step) => (
-              <button
-                key={step}
-                type="button"
-                disabled={saving}
-                onClick={() => {
-                  setShowSyncDock(true);
-                  void adjustOffset(step);
-                }}
-                className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white disabled:opacity-40"
-              >
-                {step > 0
-                  ? `+${step === 1000 ? "1s" : `${step}ms`}`
-                  : step === -1000
-                    ? "-1s"
-                    : `${step}ms`}
-              </button>
-            ))}
             <button
               type="button"
               disabled={saving}
-              onClick={() => void adjustOffset(0)}
-              className="rounded-full px-2 py-0.5 font-mono text-[10px] text-white/65 transition hover:bg-white/15 hover:text-white disabled:opacity-40"
+              aria-label="Shift lyrics earlier"
+              title="Earlier (-0.25s · Shift for -1s)"
+              onClick={(e) => {
+                setShowSyncDock(true);
+                void adjustOffset(e.shiftKey ? -1000 : -250);
+              }}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-sm font-medium text-white/75 transition hover:bg-white/14 hover:text-white disabled:opacity-40"
             >
-              Reset
+              −
             </button>
+
             <button
               type="button"
-              onClick={() => setEditing((v) => !v)}
-              className="ml-1 rounded-full border border-white/18 bg-white/10 px-2.5 py-0.5 font-mono text-[10px] text-white transition hover:bg-white/20"
+              disabled={saving || offsetMs === 0}
+              title={offsetMs === 0 ? `Lyrics source: ${source}` : "Click to reset timing offset"}
+              onClick={() => void adjustOffset(0)}
+              className="flex h-7 min-w-[66px] items-center justify-center gap-1.5 rounded-full px-2 font-mono text-[11px] text-white/80 transition hover:bg-white/10 disabled:cursor-default disabled:hover:bg-transparent"
             >
-              {editing ? "Close" : "Edit LRC"}
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  autoFetching ? "animate-pulse bg-white" : syncReady ? "bg-emerald-400" : "bg-pink"
+                }`}
+              />
+              <span>
+                {autoFetching
+                  ? "Syncing"
+                  : offsetMs === 0
+                    ? "Sync"
+                    : `${offsetMs > 0 ? "+" : ""}${(offsetMs / 1000).toFixed(2).replace(/\.?0+$/, "")}s`}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={saving}
+              aria-label="Shift lyrics later"
+              title="Later (+0.25s · Shift for +1s)"
+              onClick={(e) => {
+                setShowSyncDock(true);
+                void adjustOffset(e.shiftKey ? 1000 : 250);
+              }}
+              className="flex h-7 w-7 items-center justify-center rounded-full text-sm font-medium text-white/75 transition hover:bg-white/14 hover:text-white disabled:opacity-40"
+            >
+              +
             </button>
           </div>
+
+          {hasNonLatin && (
+            <>
+              <span className="mx-0.5 h-3.5 w-px bg-white/14" aria-hidden="true" />
+              <button
+                type="button"
+                onClick={toggleRomanize}
+                aria-pressed={romanize}
+                aria-label="Toggle Hinglish transliteration"
+                title={romanize ? "Hide Hinglish pronunciation" : "Show Hinglish pronunciation"}
+                className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[11px] font-semibold transition ${
+                  romanize
+                    ? "bg-white text-ink-950"
+                    : "text-white/80 hover:bg-white/14 hover:text-white"
+                }`}
+              >
+                <span className="leading-none">अ</span>
+                <span className="opacity-45">/</span>
+                <span className="font-mono text-[10px] leading-none">A</span>
+              </button>
+            </>
+          )}
+
+          <span className="mx-0.5 h-3.5 w-px bg-white/14" aria-hidden="true" />
+
+          <button
+            type="button"
+            onClick={() => setEditing((v) => !v)}
+            className={`inline-flex h-7 items-center rounded-full px-3 text-[11px] font-medium transition ${
+              editing
+                ? "bg-white text-ink-950"
+                : "bg-white/[0.1] text-white/90 hover:bg-white/[0.18] hover:text-white"
+            }`}
+          >
+            {editing ? "Done" : "Edit"}
+          </button>
         </div>
 
         {editing && (

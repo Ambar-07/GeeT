@@ -115,8 +115,9 @@ test("LAN Party Room guest queue, live sync status, reactions, and TV stage over
   await expect(stage.getByText("· Maya")).toBeVisible();
   await expect(stage.getByText("(Maya)")).toBeVisible();
 
-  // Host starts Maya's queued track -> guest phone gets "You're On Stage" + live follow-along lyrics
+  // Host starts Maya's queued track -> host TV stage announces Maya & guest phone gets live lyrics
   await hostPage.getByRole("button", { name: /Play Up Next/ }).click();
+  await expect(stage.getByText(/Now on Stage · Maya/)).toBeVisible();
   await expect(guestPage.getByText("You're On Stage Now!")).toBeVisible();
   await expect(guestPage.getByText("Party Stage Lyric")).toBeVisible();
 
