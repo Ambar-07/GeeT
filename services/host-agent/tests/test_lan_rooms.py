@@ -357,6 +357,7 @@ def test_lan_room_host_remote_control_capability_check():
             assert offer["type"] == "mic_rtc"
             assert offer["payload"]["kind"] == "offer"
             assert offer["payload"]["from_uid"] == guest["user_id"]
+            assert offer["payload"]["from_name"] == "Remote"
 
             ws_host.send_json(
                 {
@@ -369,3 +370,8 @@ def test_lan_room_host_remote_control_capability_check():
             assert answer["type"] == "mic_rtc"
             assert answer["payload"]["kind"] == "answer"
             assert answer["payload"]["from_uid"] == host_uid
+
+        # Disconnecting a guest phone notifies host to close that peer's duet slot cleanly
+        stop_evt = ws_host.receive_json()
+        assert stop_evt["type"] == "mic_rtc"
+        assert stop_evt["payload"] == {"kind": "stop", "from_uid": guest["user_id"]}

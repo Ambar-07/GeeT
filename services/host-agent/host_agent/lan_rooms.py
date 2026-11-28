@@ -626,7 +626,11 @@ def create_lan_router(
                         host_uid = state.room["host_user_id"]
                         out_msg = {
                             "type": "mic_rtc",
-                            "payload": {**payload, "from_uid": client_uid},
+                            "payload": {
+                                **payload,
+                                "from_uid": client_uid,
+                                "from_name": display_name or "Singer",
+                            },
                         }
                         if client_uid != host_uid:
                             # Guest phone -> Host speaker peer
@@ -654,6 +658,18 @@ def create_lan_router(
             pass
         finally:
             state.connections.pop(websocket, None)
+            host_uid = state.room["host_user_id"]
+            if client_uid != host_uid and client_uid not in state.connections.values():
+                stop_msg = {
+                    "type": "mic_rtc",
+                    "payload": {"kind": "stop", "from_uid": client_uid},
+                }
+                for ws_peer, peer_uid in list(state.connections.items()):
+                    if peer_uid == host_uid:
+                        try:
+                            await ws_peer.send_json(stop_msg)
+                        except Exception:
+                            state.connections.pop(ws_peer, None)
             await manager.broadcast_presence(state)
 
     return router, manager

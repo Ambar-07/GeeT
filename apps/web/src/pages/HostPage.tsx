@@ -18,7 +18,7 @@ import {
 } from "../components/HostRoomPanel";
 import { LyricsPanel } from "../components/LyricsPanel";
 import { TvStageOverlay, type EncoreTransitionState } from "../components/TvStageOverlay";
-import { LiveMicEngine, RemoteMicReceiver } from "../lib/liveMic";
+import { LiveMicEngine, RemoteMicReceiver, type RemoteMicPeerInfo } from "../lib/liveMic";
 import type { HostRemoteCommand, MicRtcSignal } from "../lib/rooms";
 import {
   backupMetadata,
@@ -169,6 +169,7 @@ export function HostPage() {
   const [phoneMicBlocked, setPhoneMicBlocked] = useState(false);
   const [phoneMicMuted, setPhoneMicMuted] = useState(false);
   const [phoneMicMode, setPhoneMicMode] = useState<"webrtc" | "ws" | null>(null);
+  const [phoneMicPeers, setPhoneMicPeers] = useState<RemoteMicPeerInfo[]>([]);
   const micEngineRef = useRef<LiveMicEngine | null>(null);
   const remoteMicRef = useRef<RemoteMicReceiver | null>(null);
 
@@ -380,6 +381,7 @@ export function HostPage() {
       setPhoneMicLive(false);
       setPhoneMicBlocked(false);
       setPhoneMicMode(null);
+      setPhoneMicPeers([]);
       return;
     }
     const unlockHostAudio = () => {
@@ -397,6 +399,7 @@ export function HostPage() {
       setPhoneMicLive(live);
       setPhoneMicBlocked(live && rx.isSuspended());
       setPhoneMicMode(rx.getTransportMode());
+      setPhoneMicPeers(rx.getActivePeers());
     }, 250);
     return () => {
       window.removeEventListener("pointerdown", unlockHostAudio);
@@ -932,18 +935,45 @@ export function HostPage() {
           ) : (
             <>
               <span className="font-medium text-white/90">
-                Phone Mic{phoneMicMode === "webrtc" ? " · Direct" : ""}
+                {phoneMicPeers.length >= 2
+                  ? `Duet (${phoneMicPeers.length})`
+                  : phoneMicPeers.length === 1
+                    ? `Phone Mic · ${phoneMicPeers[0].name}`
+                    : `Phone Mic${phoneMicMode === "webrtc" ? " · Direct" : ""}`}
               </span>
+              {phoneMicPeers.length >= 2 && (
+                <div className="flex items-center gap-1">
+                  {phoneMicPeers.map((peer) => (
+                    <button
+                      key={peer.uid}
+                      type="button"
+                      title={peer.muted ? `Unmute ${peer.name}` : `Mute ${peer.name}`}
+                      onClick={() => {
+                        remoteMicRef.current?.setPeerMuted(peer.uid, !peer.muted);
+                        setPhoneMicPeers(remoteMicRef.current?.getActivePeers() ?? []);
+                      }}
+                      className={`max-w-[90px] truncate rounded-full px-2 py-0.5 text-[11px] font-medium transition ${
+                        peer.muted
+                          ? "bg-white/5 text-white/40 line-through hover:text-white/75"
+                          : "bg-white/12 text-white/90 hover:bg-white/20"
+                      }`}
+                    >
+                      {peer.name}
+                    </button>
+                  ))}
+                </div>
+              )}
               <button
                 type="button"
                 onClick={() => {
                   const next = !phoneMicMuted;
                   setPhoneMicMuted(next);
                   remoteMicRef.current?.setMuted(next);
+                  setPhoneMicPeers(remoteMicRef.current?.getActivePeers() ?? []);
                 }}
                 className="rounded-full bg-white/10 px-2.5 py-0.5 text-[11px] font-medium text-white/80 hover:bg-white/20 hover:text-white"
               >
-                {phoneMicMuted ? "Unmute" : "Mute"}
+                {phoneMicMuted ? "Unmute" : phoneMicPeers.length >= 2 ? "Mute All" : "Mute"}
               </button>
             </>
           )}

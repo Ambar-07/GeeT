@@ -534,10 +534,38 @@ export class PhoneMicSender {
   }
 }
 
+export const MAX_REMOTE_MICS = 4;
+
+export interface RemoteMicPeerInfo {
+  uid: string;
+  name: string;
+  muted: boolean;
+  blocked: boolean;
+}
+
+/** Scale per-peer speaker volume slightly when 2+ phones sing together to prevent clipping. */
+export function computeDuetPeerVolume(gain: number, activePeerCount: number): number {
+  const base = Math.max(0, Math.min(1, clampMicGain(gain)));
+  if (activePeerCount <= 1) return base;
+  if (activePeerCount === 2) return Math.min(1, base * 0.85);
+  return Math.min(1, base / Math.sqrt(activePeerCount));
+}
+
+interface RtcPeerSlot {
+  uid: string;
+  name: string;
+  pc: RTCPeerConnection;
+  pendingIce: RTCIceCandidateInit[];
+  audioEl: HTMLAudioElement | null;
+  connected: boolean;
+  blocked: boolean;
+  muted: boolean;
+}
+
 /**
  * Receives wireless phone mic audio on Host PC speakers.
- * Supports direct LAN WebRTC UDP (<audio> native C++ path, ~25-50ms) and
- * ultra-tight WebSocket PCM fallback (16-65ms jitter window).
+ * Supports 2+ simultaneous phones (Duet Mode) over direct LAN WebRTC UDP
+ * (<audio> native C++ path, ~25-50ms) plus low-latency WebSocket PCM fallback.
  */
 export class RemoteMicReceiver {
   private ctx: AudioContext | null = null;
@@ -551,13 +579,8 @@ export class RemoteMicReceiver {
   private level = 0;
   private lastPacketAt = 0;
 
-  // Direct LAN WebRTC peer state
-  private rtcPeer: RTCPeerConnection | null = null;
-  private rtcPeerUid: string | null = null;
-  private rtcPendingIce: RTCIceCandidateInit[] = [];
-  private rtcAudioEl: HTMLAudioElement | null = null;
-  private rtcConnected = false;
-  private rtcBlocked = false;
+  // Map of simultaneous direct LAN WebRTC phone peers keyed by guest user_id
+  private peers = new Map<string, RtcPeerSlot>();
 
   private ensureContext(): AudioContext | null {
     if (this.ctx) {
@@ -592,23 +615,44 @@ export class RemoteMicReceiver {
     return ctx;
   }
 
-  private closeRtcPeer(): void {
-    this.rtcConnected = false;
-    this.rtcBlocked = false;
-    this.rtcPeerUid = null;
-    this.rtcPendingIce = [];
-    if (this.rtcPeer) {
-      this.rtcPeer.onicecandidate = null;
-      this.rtcPeer.ontrack = null;
-      this.rtcPeer.onconnectionstatechange = null;
-      this.rtcPeer.close();
-      this.rtcPeer = null;
+  private rebalancePeerVolumes(): void {
+    const activeCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
+    const vol = computeDuetPeerVolume(this.gain, Math.max(1, activeCount));
+    for (const slot of this.peers.values()) {
+      if (slot.audioEl) {
+        slot.audioEl.volume = vol;
+        slot.audioEl.muted = this.muted || slot.muted;
+      }
     }
-    if (this.rtcAudioEl) {
-      this.rtcAudioEl.pause();
-      this.rtcAudioEl.srcObject = null;
-      this.rtcAudioEl = null;
+  }
+
+  private closePeer(uid: string): void {
+    const slot = this.peers.get(uid);
+    if (!slot) return;
+    this.peers.delete(uid);
+    slot.pc.onicecandidate = null;
+    slot.pc.ontrack = null;
+    slot.pc.onconnectionstatechange = null;
+    slot.pc.close();
+    if (slot.audioEl) {
+      slot.audioEl.pause();
+      slot.audioEl.srcObject = null;
+      slot.audioEl = null;
     }
+    this.rebalancePeerVolumes();
+  }
+
+  private closeAllPeers(): void {
+    for (const uid of Array.from(this.peers.keys())) {
+      this.closePeer(uid);
+    }
+  }
+
+  private hasConnectedRtc(): boolean {
+    for (const slot of this.peers.values()) {
+      if (slot.connected) return true;
+    }
+    return false;
   }
 
   async handleRtcSignal(
@@ -620,19 +664,33 @@ export class RemoteMicReceiver {
     if (!fromUid) return;
 
     if (signal.kind === "stop") {
-      if (this.rtcPeerUid === fromUid) this.closeRtcPeer();
+      this.closePeer(fromUid);
       return;
     }
 
     if (signal.kind === "offer" && signal.sdp) {
-      this.closeRtcPeer();
+      // Replace any stale connection from this same phone without disturbing other duet singers
+      this.closePeer(fromUid);
+      if (this.peers.size >= MAX_REMOTE_MICS) {
+        const oldestUid = this.peers.keys().next().value;
+        if (oldestUid) this.closePeer(oldestUid);
+      }
+
       const pc = new RTCPeerConnection({ iceServers: [] });
-      this.rtcPeer = pc;
-      this.rtcPeerUid = fromUid;
-      this.rtcPendingIce = [];
+      const slot: RtcPeerSlot = {
+        uid: fromUid,
+        name: signal.fromName?.trim() || "Singer",
+        pc,
+        pendingIce: [],
+        audioEl: null,
+        connected: false,
+        blocked: false,
+        muted: false,
+      };
+      this.peers.set(fromUid, slot);
 
       pc.onicecandidate = (ev) => {
-        if (ev.candidate && this.rtcPeer === pc) {
+        if (ev.candidate && this.peers.get(fromUid) === slot) {
           sendReply({
             toUid: fromUid,
             kind: "ice",
@@ -642,39 +700,39 @@ export class RemoteMicReceiver {
       };
 
       pc.onconnectionstatechange = () => {
-        if (this.rtcPeer !== pc) return;
-        this.rtcConnected = pc.connectionState === "connected";
+        if (this.peers.get(fromUid) !== slot) return;
+        slot.connected = pc.connectionState === "connected";
+        this.rebalancePeerVolumes();
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          this.closeRtcPeer();
+          this.closePeer(fromUid);
         }
       };
 
       pc.ontrack = (ev) => {
-        if (this.rtcPeer !== pc) return;
+        if (this.peers.get(fromUid) !== slot) return;
         const stream = ev.streams[0] ?? new MediaStream([ev.track]);
         const audio = document.createElement("audio");
         audio.autoplay = true;
         audio.srcObject = stream;
-        audio.volume = Math.max(0, Math.min(1, this.gain));
-        audio.muted = this.muted;
-        this.rtcAudioEl = audio;
-        this.rtcConnected = true;
+        slot.audioEl = audio;
+        slot.connected = true;
+        this.rebalancePeerVolumes();
         void audio
           .play()
           .then(() => {
-            this.rtcBlocked = false;
+            slot.blocked = false;
           })
           .catch(() => {
-            this.rtcBlocked = true;
+            slot.blocked = true;
           });
       };
 
       try {
         await pc.setRemoteDescription({ type: "offer", sdp: signal.sdp });
-        for (const cand of this.rtcPendingIce) {
+        for (const cand of slot.pendingIce) {
           await pc.addIceCandidate(cand).catch(() => {});
         }
-        this.rtcPendingIce = [];
+        slot.pendingIce = [];
         const answer = await pc.createAnswer();
         const tunedAnswer: RTCSessionDescriptionInit = {
           type: answer.type,
@@ -683,30 +741,34 @@ export class RemoteMicReceiver {
         await pc.setLocalDescription(tunedAnswer);
         sendReply({ toUid: fromUid, kind: "answer", sdp: tunedAnswer.sdp });
       } catch {
-        this.closeRtcPeer();
+        this.closePeer(fromUid);
       }
       return;
     }
 
-    if (signal.kind === "ice" && signal.candidate && this.rtcPeer && this.rtcPeerUid === fromUid) {
-      if (this.rtcPeer.remoteDescription) {
-        await this.rtcPeer.addIceCandidate(signal.candidate).catch(() => {});
+    if (signal.kind === "ice" && signal.candidate) {
+      const slot = this.peers.get(fromUid);
+      if (!slot) return;
+      if (slot.pc.remoteDescription) {
+        await slot.pc.addIceCandidate(signal.candidate).catch(() => {});
       } else {
-        this.rtcPendingIce.push(signal.candidate);
+        slot.pendingIce.push(signal.candidate);
       }
     }
   }
 
-  /** Call inside a host user gesture (click/keypress) to unlock speaker output for both WebRTC and WS audio. */
+  /** Call inside a host user gesture (click/keypress) to unlock speaker output for all duet peers and WS audio. */
   async unlock(): Promise<boolean> {
     let ok = true;
-    if (this.rtcAudioEl) {
-      try {
-        await this.rtcAudioEl.play();
-        this.rtcBlocked = false;
-      } catch {
-        this.rtcBlocked = true;
-        ok = false;
+    for (const slot of this.peers.values()) {
+      if (slot.audioEl) {
+        try {
+          await slot.audioEl.play();
+          slot.blocked = false;
+        } catch {
+          slot.blocked = true;
+          ok = false;
+        }
       }
     }
     const ctx = this.ensureContext();
@@ -717,30 +779,57 @@ export class RemoteMicReceiver {
         ok = false;
       }
     }
-    return ok && !this.rtcBlocked;
+    return ok && !this.isSuspended();
   }
 
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (this.rtcAudioEl) this.rtcAudioEl.muted = muted;
+    this.rebalancePeerVolumes();
+  }
+
+  setPeerMuted(uid: string, muted: boolean): void {
+    const slot = this.peers.get(uid);
+    if (!slot) return;
+    slot.muted = muted;
+    this.rebalancePeerVolumes();
   }
 
   isMuted(): boolean {
     return this.muted;
   }
 
+  getActivePeers(): RemoteMicPeerInfo[] {
+    const list: RemoteMicPeerInfo[] = [];
+    for (const slot of this.peers.values()) {
+      if (slot.connected) {
+        list.push({
+          uid: slot.uid,
+          name: slot.name,
+          muted: this.muted || slot.muted,
+          blocked: slot.blocked,
+        });
+      }
+    }
+    return list;
+  }
+
   isSuspended(): boolean {
-    if (this.rtcConnected) return this.rtcBlocked;
+    if (this.hasConnectedRtc()) {
+      for (const slot of this.peers.values()) {
+        if (slot.connected && slot.blocked) return true;
+      }
+      return false;
+    }
     return Boolean(this.ctx && this.ctx.state !== "running");
   }
 
   isReceiving(): boolean {
-    if (this.rtcConnected) return true;
+    if (this.hasConnectedRtc()) return true;
     return this.lastPacketAt > 0 && Date.now() - this.lastPacketAt < 1200;
   }
 
   getTransportMode(): "webrtc" | "ws" | null {
-    if (this.rtcConnected) return "webrtc";
+    if (this.hasConnectedRtc()) return "webrtc";
     if (this.lastPacketAt > 0 && Date.now() - this.lastPacketAt < 1200) return "ws";
     return null;
   }
@@ -752,9 +841,7 @@ export class RemoteMicReceiver {
   applyMix(gain: number, reverb: number): void {
     this.gain = clampMicGain(gain);
     this.reverb = clampReverbMix(reverb);
-    if (this.rtcAudioEl) {
-      this.rtcAudioEl.volume = Math.max(0, Math.min(1, this.gain));
-    }
+    this.rebalancePeerVolumes();
     if (!this.ctx || !this.dryGain || !this.wetGain) return;
     const now = this.ctx.currentTime;
     this.dryGain.gain.setTargetAtTime(this.gain * (1 - this.reverb * 0.35), now, 0.02);
@@ -762,7 +849,7 @@ export class RemoteMicReceiver {
   }
 
   enqueue(pcm: ArrayBuffer): void {
-    if (pcm.byteLength < 4 || this.rtcConnected) return;
+    if (pcm.byteLength < 4 || this.hasConnectedRtc()) return;
     this.lastPacketAt = Date.now();
     const samples = int16ToFloat32(pcm);
     let sumSq = 0;
@@ -797,7 +884,7 @@ export class RemoteMicReceiver {
   }
 
   stop(): void {
-    this.closeRtcPeer();
+    this.closeAllPeers();
     this.nextPlayTime = 0;
     this.level = 0;
     this.lastPacketAt = 0;

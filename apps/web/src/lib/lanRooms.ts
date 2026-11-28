@@ -367,6 +367,7 @@ export function subscribeToLanRoom(
         ) {
           callbacks.onMicRtcSignal?.({
             fromUid: msg.payload.from_uid ? String(msg.payload.from_uid) : undefined,
+            fromName: msg.payload.from_name ? String(msg.payload.from_name) : undefined,
             toUid: msg.payload.to_uid ? String(msg.payload.to_uid) : undefined,
             kind: msg.payload.kind as MicRtcSignal["kind"],
             sdp: typeof msg.payload.sdp === "string" ? msg.payload.sdp : undefined,

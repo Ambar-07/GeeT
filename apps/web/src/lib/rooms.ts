@@ -310,6 +310,7 @@ export interface HostRemoteCommand {
 
 export interface MicRtcSignal {
   fromUid?: string;
+  fromName?: string;
   toUid?: string;
   kind: "offer" | "answer" | "ice" | "stop";
   sdp?: string;

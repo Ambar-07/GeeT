@@ -3,6 +3,7 @@ import {
   buildHallImpulse,
   clampMicGain,
   clampReverbMix,
+  computeDuetPeerVolume,
   downsampleToInt16,
   int16ToFloat32,
   tuneLowLatencyOpusSdp,
@@ -56,5 +57,11 @@ describe("liveMic helpers", () => {
     expect(tuned).toContain("a=fmtp:111 minptime=10;ptime=10;useinbandfec=0;stereo=0");
     expect(tuned).toContain("a=ptime:10");
     expect(tuned).toContain("a=maxptime:20");
+  });
+
+  it("scales per-peer volume smoothly for solo vs duet singers", () => {
+    expect(computeDuetPeerVolume(1.0, 1)).toBe(1.0);
+    expect(computeDuetPeerVolume(1.0, 2)).toBeCloseTo(0.85, 2);
+    expect(computeDuetPeerVolume(1.0, 4)).toBeCloseTo(0.5, 2);
   });
 });
